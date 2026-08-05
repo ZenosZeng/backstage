@@ -1,0 +1,20 @@
+# S3-backed shared workspace state
+/config/
+/long-term/
+/skills/
+/memory/
+
+# Machine-local runtime state
+/config.json
+/.locks/
+/.sync/
+
+# Python caches and test artifacts
+**/__pycache__/
+**/*.py[cod]
+/.pytest_cache/
+/.coverage
+/htmlcov/
+
+# Editor and OS metadata
+.DS_Store
