@@ -353,7 +353,7 @@ class SyncTest(unittest.TestCase):
         with mock.patch.object(SYNC.Path, "home", return_value=home):
             SYNC.configure_agent_links(self.root, self.config, dry_run=False)
 
-        for agent_home in (".codex", ".claude"):
+        for agent_home in (".codex", ".claude", ".kimi-code"):
             for name in ("memory", "update-workspace-memory"):
                 link = home / agent_home / "skills" / name
                 self.assertTrue(link.is_symlink())

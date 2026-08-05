@@ -1,6 +1,6 @@
 # Agent 工作区记忆核心
 
-这是供 Codex 和 Claude Code 共用的轻量级多 Agent 工作区记忆系统。
+这是供 Codex、Claude Code 和 Kimi Code 共用的轻量级多 Agent 工作区记忆系统。
 
 公共仓库只保存可复用代码；工作区专属的 Skill、Prompt、项目知识和记忆保存在私有 S3 兼容存储中。Git、源码、配置、测试结果和实际环境始终是真实来源，memory 只作为可追溯的导航和认知缓存。
 
@@ -78,7 +78,7 @@ git clone <公共仓库地址> ~/code/.agents
 1. 读取 Git 中的 `config.template.json`，并下载 S3 shared 内容；
 2. 生成本机 `config.json`；
 3. 拉取其他机器的 raw memory；
-4. 将全部共享 Skill 同源链接到 Codex 和 Claude，遇到同名不同来源的已有 Skill 时拒绝覆盖；
+4. 将全部共享 Skill 同源链接到 Codex、Claude 和 Kimi，遇到同名不同来源的已有 Skill 时拒绝覆盖；
 5. 创建工作区 `AGENTS.md` 和 `CLAUDE.md` Prompt 链接；
 6. 校验 memory 数据。
 

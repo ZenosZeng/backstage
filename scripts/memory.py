@@ -443,7 +443,7 @@ def parser() -> argparse.ArgumentParser:
     subparsers = result.add_subparsers(dest="command", required=True)
 
     add = subparsers.add_parser("add", help="原子追加一条事件")
-    add.add_argument("--agent", required=True, choices=("codex", "claude"))
+    add.add_argument("--agent", required=True, choices=("codex", "claude", "kimi"))
     add.add_argument("--project", action="append", default=[])
     add.add_argument("--task")
     add.add_argument("--type", dest="event_type", required=True, choices=sorted(EVENT_TYPES))

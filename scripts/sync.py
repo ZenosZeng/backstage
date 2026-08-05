@@ -598,7 +598,7 @@ def configure_agent_links(root: Path, config: dict[str, Any], *, dry_run: bool) 
     if not skills:
         raise SyncError(f"共享 Skill 目录为空：{skills_root}")
     for skill in skills:
-        for agent_home in (".codex", ".claude"):
+        for agent_home in (".codex", ".claude", ".kimi-code"):
             ensure_link(
                 Path.home() / agent_home / "skills" / skill.name,
                 skill,

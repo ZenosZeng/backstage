@@ -110,6 +110,12 @@ class MemoryCliTest(unittest.TestCase):
         files = sorted((self.root / "memory" / "test-machine").glob("*/*.json"))
         self.assertEqual([path.parent.name for path in files], ["claude", "codex"])
 
+    def test_kimi_agent_can_add_event(self) -> None:
+        self.add("Kimi 事件", agent="kimi")
+        status = self.run_cli("status")
+        self.assertIn("'kimi': 1", status.stdout)
+        self.run_cli("validate")
+
     def test_import_is_idempotent_and_supports_multiple_projects(self) -> None:
         event = {
             "schema_version": 1,
