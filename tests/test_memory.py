@@ -107,7 +107,7 @@ class MemoryCliTest(unittest.TestCase):
     def test_agents_write_separate_daily_files(self) -> None:
         self.add("Codex 事件", agent="codex")
         self.add("Claude 事件", agent="claude")
-        files = sorted((self.root / "memory" / "test-machine").glob("*/*.json"))
+        files = sorted((self.root / ".share" / "memory" / "test-machine").glob("*/*.json"))
         self.assertEqual([path.parent.name for path in files], ["claude", "codex"])
 
     def test_kimi_agent_can_add_event(self) -> None:
@@ -189,7 +189,7 @@ class MemoryCliTest(unittest.TestCase):
         result = self.run_cli("import", "--input", str(source), check=False)
         self.assertEqual(result.returncode, 2)
         self.assertIn("疑似包含 secret", result.stderr)
-        self.assertFalse((self.root / "memory").exists())
+        self.assertFalse((self.root / ".share" / "memory").exists())
 
 
 if __name__ == "__main__":

@@ -230,7 +230,7 @@ def shared_lock(root: Path) -> Iterator[None]:
 
 def push_memory(root: Path, config: dict[str, Any], *, dry_run: bool) -> None:
     machine_id = str(config["machine_id"])
-    source = root / "memory" / machine_id
+    source = root / ".share" / "memory" / machine_id
     source.mkdir(parents=True, exist_ok=True)
     sync = config["sync"]
     if not any(source.rglob("*.json")):
@@ -242,7 +242,7 @@ def push_memory(root: Path, config: dict[str, Any], *, dry_run: bool) -> None:
 
 
 def push_all_memory(root: Path, config: dict[str, Any], *, dry_run: bool) -> None:
-    source = root / "memory"
+    source = root / ".share" / "memory"
     source.mkdir(parents=True, exist_ok=True)
     sync = config["sync"]
     mirror(
@@ -270,7 +270,7 @@ def pull_other_memory(root: Path, config: dict[str, Any], *, dry_run: bool) -> N
         staging.mkdir()
         mirror(remote, staging, clear_proxy=clear_proxy, dry_run=False)
         validate_daily_files(staging)
-        destination = root / "memory"
+        destination = root / ".share" / "memory"
         destination.mkdir(parents=True, exist_ok=True)
         for machine in staging.iterdir():
             if not machine.is_dir() or machine.name == config["machine_id"]:
@@ -282,15 +282,15 @@ def pull_other_memory(root: Path, config: dict[str, Any], *, dry_run: bool) -> N
 def copy_shared_snapshot(source: Path, destination: Path) -> None:
     destination.mkdir(parents=True, exist_ok=True)
     for name in SHARED_DIRS:
-        path = source / name
+        path = source / ".share" / name
         if path.is_dir():
-            shutil.copytree(path, destination / name, dirs_exist_ok=True, ignore=COPY_IGNORE)
+            shutil.copytree(path, destination / ".share" / name, dirs_exist_ok=True, ignore=COPY_IGNORE)
 
 
 def shared_manifest(snapshot: Path) -> dict[str, str]:
     manifest: dict[str, str] = {}
     for name in SHARED_DIRS:
-        path = snapshot / name
+        path = snapshot / ".share" / name
         if path.is_dir():
             for file_path in sorted(path.rglob("*")):
                 if not file_path.is_file():
@@ -326,8 +326,8 @@ def replace_directory(source: Path, target: Path) -> None:
 
 def install_shared_snapshot(root: Path, snapshot: Path) -> None:
     for name in SHARED_DIRS:
-        source = snapshot / name
-        target = root / name
+        source = snapshot / ".share" / name
+        target = root / ".share" / name
         if source.is_dir():
             replace_directory(source, target)
         else:
@@ -389,7 +389,7 @@ def download_shared(
 ) -> None:
     destination.mkdir(parents=True, exist_ok=True)
     for name in SHARED_DIRS:
-        target = destination / name
+        target = destination / ".share" / name
         if not dry_run:
             target.mkdir(parents=True, exist_ok=True)
         mirror(
@@ -415,13 +415,13 @@ def upload_shared(
         missing = [
             name
             for name in SHARED_DIRS
-            if not (snapshot / name).is_dir()
+            if not (snapshot / ".share" / name).is_dir()
         ]
         if missing:
             raise SyncError("本地 shared 内容不完整：" + ", ".join(missing))
         for name in SHARED_DIRS:
             mirror(
-                snapshot / name,
+                snapshot / ".share" / name,
                 remote_path(remote, name),
                 clear_proxy=clear_proxy,
                 dry_run=dry_run,
@@ -591,7 +591,7 @@ def ensure_link(path: Path, target: Path, *, dry_run: bool) -> None:
 
 
 def configure_agent_links(root: Path, config: dict[str, Any], *, dry_run: bool) -> None:
-    skills_root = root / "skills"
+    skills_root = root / ".share" / "skills"
     skills = sorted(
         path for path in skills_root.iterdir() if path.is_dir() and (path / "SKILL.md").is_file()
     )
@@ -605,8 +605,8 @@ def configure_agent_links(root: Path, config: dict[str, Any], *, dry_run: bool) 
                 dry_run=dry_run,
             )
     workspace = Path(os.path.expanduser(str(config["workspace_root"])))
-    ensure_link(workspace / "AGENTS.md", root / "config" / "prompts" / "AGENTS.md", dry_run=dry_run)
-    ensure_link(workspace / "CLAUDE.md", root / "config" / "prompts" / "CLAUDE.md", dry_run=dry_run)
+    ensure_link(workspace / "AGENTS.md", root / ".share" / "config" / "prompts" / "AGENTS.md", dry_run=dry_run)
+    ensure_link(workspace / "CLAUDE.md", root / ".share" / "config" / "prompts" / "CLAUDE.md", dry_run=dry_run)
 
 
 def build_local_config(
@@ -819,7 +819,7 @@ def command_resolve_shared(root: Path, args: argparse.Namespace) -> int:
 
 def command_status(root: Path, args: argparse.Namespace) -> int:
     config = load_config(root, require_initialized=False)
-    files = list((root / "memory").glob("*/*/*.json"))
+    files = list((root / ".share" / "memory").glob("*/*/*.json"))
     event_count = 0
     machines: set[str] = set()
     for path in files:

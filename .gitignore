@@ -1,9 +1,5 @@
-# S3-backed shared workspace state
-/config/
-/long-term/
-/skills/
-/memory/
-/shared_files/
+# S3-backed shared workspace state（统一收纳在 .share/）
+/.share/
 
 # Machine-local runtime state（统一收纳在 .local/；config.json 保留根目录）
 /.local/

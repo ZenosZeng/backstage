@@ -205,7 +205,7 @@ def validate_event(event: dict[str, Any]) -> list[str]:
 
 def daily_path(root: Path, event: dict[str, Any]) -> Path:
     date = str(event["created_at"])[:10]
-    return root / "memory" / str(event["machine_id"]) / str(event["agent"]) / f"{date}.json"
+    return root / ".share" / "memory" / str(event["machine_id"]) / str(event["agent"]) / f"{date}.json"
 
 
 @contextmanager
@@ -277,7 +277,7 @@ def append_events(root: Path, events: list[dict[str, Any]]) -> tuple[int, int]:
 
 
 def memory_files(root: Path) -> list[Path]:
-    return sorted((root / "memory").glob("*/*/*.json"))
+    return sorted((root / ".share" / "memory").glob("*/*/*.json"))
 
 
 def load_events(root: Path) -> tuple[list[dict[str, Any]], list[str]]:

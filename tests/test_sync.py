@@ -58,10 +58,10 @@ class SyncTest(unittest.TestCase):
 
     def write_shared(self, base: Path, marker: str) -> None:
         files = {
-            "config/prompts/AGENTS.md": f"agents {marker}\n",
-            "config/prompts/CLAUDE.md": f"claude {marker}\n",
-            "long-term/_workspace.md": f"workspace {marker}\n",
-            "skills/memory/SKILL.md": f"skill {marker}\n",
+            ".share/config/prompts/AGENTS.md": f"agents {marker}\n",
+            ".share/config/prompts/CLAUDE.md": f"claude {marker}\n",
+            ".share/long-term/_workspace.md": f"workspace {marker}\n",
+            ".share/skills/memory/SKILL.md": f"skill {marker}\n",
         }
         for relative, content in files.items():
             path = base / relative
@@ -95,16 +95,16 @@ class SyncTest(unittest.TestCase):
         self.assertNotIn("secret", json.dumps(config).casefold())
 
     def test_push_memory_uploads_only_current_machine(self) -> None:
-        self.write_daily(self.root / "memory", "machine-a", "codex", "local")
-        self.write_daily(self.root / "memory", "machine-b", "claude", "cached")
+        self.write_daily(self.root / ".share" / "memory", "machine-a", "codex", "local")
+        self.write_daily(self.root / ".share" / "memory", "machine-b", "claude", "cached")
         with mock.patch.object(SYNC, "mirror") as mirror:
             SYNC.push_memory(self.root, self.config, dry_run=False)
         source, target = mirror.call_args.args
-        self.assertEqual(source, self.root / "memory" / "machine-a")
+        self.assertEqual(source, self.root / ".share" / "memory" / "machine-a")
         self.assertEqual(target, "bos/bucket/agent-memory-v2/memory/machine-a")
 
     def test_pull_memory_preserves_owned_prefix(self) -> None:
-        local_owned = self.write_daily(self.root / "memory", "machine-a", "codex", "local-new")
+        local_owned = self.write_daily(self.root / ".share" / "memory", "machine-a", "codex", "local-new")
         remote = Path(self.temporary.name) / "remote-memory"
         self.write_daily(remote, "machine-a", "codex", "remote-stale")
         self.write_daily(remote, "machine-b", "claude", "remote-new")
@@ -120,7 +120,7 @@ class SyncTest(unittest.TestCase):
 
         owned = json.loads(local_owned.read_text(encoding="utf-8"))
         other = json.loads(
-            (self.root / "memory" / "machine-b" / "claude" / "2026-08-05.json").read_text(
+            (self.root / ".share" / "memory" / "machine-b" / "claude" / "2026-08-05.json").read_text(
                 encoding="utf-8"
             )
         )
@@ -139,7 +139,7 @@ class SyncTest(unittest.TestCase):
                 allow_non_writer=False,
             )
         self.assertEqual(
-            (self.root / "long-term" / "_workspace.md").read_text(encoding="utf-8"),
+            (self.root / ".share" / "long-term" / "_workspace.md").read_text(encoding="utf-8"),
             "workspace remote\n",
         )
         self.assertTrue(SYNC.shared_base(self.root).is_dir())
@@ -160,12 +160,12 @@ class SyncTest(unittest.TestCase):
                 allow_non_writer=False,
             )
         self.assertEqual(
-            (self.root / "long-term" / "_workspace.md").read_text(encoding="utf-8"),
+            (self.root / ".share" / "long-term" / "_workspace.md").read_text(encoding="utf-8"),
             "workspace local\n",
         )
         self.assertTrue((SYNC.shared_conflict(self.root) / "report.json").is_file())
         self.assertEqual(
-            (SYNC.shared_conflict(self.root) / "remote" / "long-term" / "_workspace.md").read_text(
+            (SYNC.shared_conflict(self.root) / "remote" / ".share" / "long-term" / "_workspace.md").read_text(
                 encoding="utf-8"
             ),
             "workspace remote\n",
@@ -185,7 +185,7 @@ class SyncTest(unittest.TestCase):
                 allow_non_writer=False,
             )
         self.assertEqual(
-            (self.root / "skills" / "memory" / "SKILL.md").read_text(encoding="utf-8"),
+            (self.root / ".share" / "skills" / "memory" / "SKILL.md").read_text(encoding="utf-8"),
             "skill remote\n",
         )
 
@@ -194,7 +194,7 @@ class SyncTest(unittest.TestCase):
         SYNC.update_shared_base(self.root, self.root)
         remote = Path(self.temporary.name) / "remote-shared"
         self.write_shared(remote, "base")
-        (self.root / "skills" / "memory" / "SKILL.md").write_text(
+        (self.root / ".share" / "skills" / "memory" / "SKILL.md").write_text(
             "skill local\n", encoding="utf-8"
         )
         with (
@@ -217,7 +217,7 @@ class SyncTest(unittest.TestCase):
         SYNC.update_shared_base(self.root, self.root)
         remote = Path(self.temporary.name) / "remote-shared"
         self.write_shared(remote, "base")
-        (self.root / "skills" / "memory" / "SKILL.md").write_text(
+        (self.root / ".share" / "skills" / "memory" / "SKILL.md").write_text(
             "skill local\n", encoding="utf-8"
         )
         with (
@@ -235,7 +235,7 @@ class SyncTest(unittest.TestCase):
     def test_both_sides_changed_requires_merge(self) -> None:
         self.write_shared(self.root, "base")
         SYNC.update_shared_base(self.root, self.root)
-        (self.root / "long-term" / "_workspace.md").write_text(
+        (self.root / ".share" / "long-term" / "_workspace.md").write_text(
             "workspace local\n", encoding="utf-8"
         )
         remote = Path(self.temporary.name) / "remote-shared"
@@ -254,13 +254,13 @@ class SyncTest(unittest.TestCase):
         report = json.loads(
             (SYNC.shared_conflict(self.root) / "report.json").read_text(encoding="utf-8")
         )
-        self.assertIn("long-term/_workspace.md", report["local_changes"])
-        self.assertIn("long-term/_workspace.md", report["remote_changes"])
+        self.assertIn(".share/long-term/_workspace.md", report["local_changes"])
+        self.assertIn(".share/long-term/_workspace.md", report["remote_changes"])
 
     def test_resolve_refuses_when_remote_changed_again(self) -> None:
         self.write_shared(self.root, "base")
         SYNC.update_shared_base(self.root, self.root)
-        (self.root / "long-term" / "_workspace.md").write_text(
+        (self.root / ".share" / "long-term" / "_workspace.md").write_text(
             "workspace local\n", encoding="utf-8"
         )
         remote = Path(self.temporary.name) / "remote-shared"
@@ -333,7 +333,7 @@ class SyncTest(unittest.TestCase):
         self.assertTrue(config["sync"]["initialized"])
         self.assertNotIn("projects", config)
         self.assertEqual(
-            (self.root / "long-term" / "_workspace.md").read_text(encoding="utf-8"),
+            (self.root / ".share" / "long-term" / "_workspace.md").read_text(encoding="utf-8"),
             "workspace remote\n",
         )
 
@@ -342,10 +342,10 @@ class SyncTest(unittest.TestCase):
         workspace = Path(self.temporary.name) / "workspace"
         self.config["workspace_root"] = str(workspace)
         for name in ("memory", "update-workspace-memory"):
-            skill = self.root / "skills" / name
+            skill = self.root / ".share" / "skills" / name
             skill.mkdir(parents=True, exist_ok=True)
             (skill / "SKILL.md").write_text(f"# {name}\n", encoding="utf-8")
-        prompts = self.root / "config" / "prompts"
+        prompts = self.root / ".share" / "config" / "prompts"
         prompts.mkdir(parents=True, exist_ok=True)
         (prompts / "AGENTS.md").write_text("agents\n", encoding="utf-8")
         (prompts / "CLAUDE.md").write_text("claude\n", encoding="utf-8")
@@ -357,7 +357,7 @@ class SyncTest(unittest.TestCase):
             for name in ("memory", "update-workspace-memory"):
                 link = home / agent_home / "skills" / name
                 self.assertTrue(link.is_symlink())
-                self.assertEqual(link.resolve(), (self.root / "skills" / name).resolve())
+                self.assertEqual(link.resolve(), (self.root / ".share" / "skills" / name).resolve())
         self.assertEqual((workspace / "AGENTS.md").resolve(), (prompts / "AGENTS.md").resolve())
         self.assertEqual((workspace / "CLAUDE.md").resolve(), (prompts / "CLAUDE.md").resolve())
 
