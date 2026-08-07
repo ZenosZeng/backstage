@@ -3,11 +3,11 @@
 /long-term/
 /skills/
 /memory/
+/shared_files/
 
-# Machine-local runtime state
+# Machine-local runtime state（统一收纳在 .local/；config.json 保留根目录）
+/.local/
 /config.json
-/.locks/
-/.sync/
 
 # Python caches and test artifacts
 **/__pycache__/
@@ -18,4 +18,3 @@
 
 # Editor and OS metadata
 .DS_Store
-/shared_files/

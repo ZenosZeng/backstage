@@ -218,7 +218,7 @@ def validate_daily_files(root: Path) -> None:
 
 @contextmanager
 def shared_lock(root: Path) -> Iterator[None]:
-    path = root / ".locks" / "shared-sync.lock"
+    path = root / ".local" / ".locks" / "shared-sync.lock"
     path.parent.mkdir(parents=True, exist_ok=True)
     with path.open("a+", encoding="utf-8") as handle:
         fcntl.flock(handle.fileno(), fcntl.LOCK_EX)
@@ -309,11 +309,11 @@ def changed_paths(base: dict[str, str], side: dict[str, str]) -> list[str]:
 
 
 def shared_base(root: Path) -> Path:
-    return root / ".sync" / "base"
+    return root / ".local" / ".sync" / "base"
 
 
 def shared_conflict(root: Path) -> Path:
-    return root / ".sync" / "conflict"
+    return root / ".local" / ".sync" / "conflict"
 
 
 def replace_directory(source: Path, target: Path) -> None:

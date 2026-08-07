@@ -210,7 +210,7 @@ def daily_path(root: Path, event: dict[str, Any]) -> Path:
 
 @contextmanager
 def file_lock(root: Path, machine: str, agent: str, date: str) -> Iterator[None]:
-    lock_path = root / ".locks" / machine / agent / f"{date}.lock"
+    lock_path = root / ".local" / ".locks" / machine / agent / f"{date}.lock"
     lock_path.parent.mkdir(parents=True, exist_ok=True)
     with lock_path.open("a", encoding="utf-8") as handle:
         fcntl.flock(handle.fileno(), fcntl.LOCK_EX)
