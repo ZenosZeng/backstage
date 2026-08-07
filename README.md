@@ -9,9 +9,9 @@
 | 层级 | 内容 | 真实来源 |
 |---|---|---|
 | 公共核心 | `config.template.json`、`scripts/`、`tests/`、CI 和文档 | Git |
-| 共享工作区状态 | `config/`、`skills/`、`long-term/` | S3 |
+| 共享工作区状态（本地收纳于 `.agents/.share/`） | `config/`、`skills/`、`long-term/`、`shared_files/`、`memory/` | S3 |
 | 原始记忆事件 | `memory/<machine>/<agent>/<UTC-date>.json` | S3 |
-| 本机运行状态 | `config.json`、`.locks/`、`.sync/` | 仅本机 |
+| 本机运行状态（本地收纳于 `.agents/.local/`，`config.json` 保留根目录） | `config.json`、`.locks/`、`.sync/` | 仅本机 |
 
 原始事件按机器和 Agent 分区，每台机器只上传自己的前缀。共享状态采用完整目录同步，并使用本地基线检测本地与 S3 是否发生分叉。
 
@@ -29,7 +29,7 @@
 └── tests/
 ```
 
-`config.template.json` 随 Git 发布。执行 S3 初始化后，本地会出现 `skills/`、`long-term/` 和 `config/`；这些工作区专属内容均被 Git 忽略。
+`config.template.json` 随 Git 发布。执行 S3 初始化后，本地会出现 `.share/`（`config/`、`skills/`、`long-term/`、`memory/`、`shared_files/`）和 `.local/`（`.locks/`、`.sync/`）；这些工作区专属内容均被 Git 忽略，顶层只保留 `config.json`。
 
 ## S3 结构
 
@@ -43,7 +43,7 @@
     └── <machine>/<agent>/<UTC-date>.json
 ```
 
-S3 不设置 release 目录，也不额外实现对象版本管理。Git 中的 `config.template.json` 是新机器初始化的唯一模板；它不包含 remote、项目名称或仓库路径。初始化时会基于它生成本机专属、不会上传的 `config.json`。
+S3 目录与本地 `.share/` 下的目录一一对应（远端目录名不变，仅本地收纳位置统一在 `.share/` 下）。S3 不设置 release 目录，也不额外实现对象版本管理。Git 中的 `config.template.json` 是新机器初始化的唯一模板；它不包含 remote、项目名称或仓库路径。初始化时会基于它生成本机专属、不会上传的 `config.json`。
 
 ## 新机器初始化
 
@@ -121,15 +121,15 @@ python3 scripts/sync.py resolve-shared
 
 ## Shared 分叉保护
 
-最近一次成功对齐的 shared 完整副本缓存在 `.sync/base/`。同步前会比较三份内容：
+最近一次成功对齐的 shared 完整副本缓存在 `.local/.sync/base/`。同步前会比较三份内容：
 
 1. 上次共同基线；
 2. 当前本地 shared；
 3. 当前 S3 shared。
 
-每个文件按相对路径和 SHA256 比较。只有一侧变化时自动同步；本地和 S3 都相对基线发生变化时，不覆盖任何一方，而是将远端快照和差异报告保存到 `.sync/conflict/`。
+每个文件按相对路径和 SHA256 比较。只有一侧变化时自动同步；本地和 S3 都相对基线发生变化时，不覆盖任何一方，而是将远端快照和差异报告保存到 `.local/.sync/conflict/`。
 
-人工将 `.sync/conflict/remote/` 合并到当前本地 shared 后运行：
+人工将 `.local/.sync/conflict/remote/` 合并到当前本地 shared 后运行：
 
 ```bash
 python3 scripts/memory.py validate
