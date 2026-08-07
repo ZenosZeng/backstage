@@ -22,7 +22,7 @@ from typing import Any, Iterator
 
 
 ROOT = Path(__file__).resolve().parents[1]
-SHARED_DIRS = ("config", "long-term", "skills")
+SHARED_DIRS = ("config", "long-term", "skills", "shared_files")
 SAFE_NAME = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.-]*$")
 PROXY_KEYS = {
     "all_proxy",
