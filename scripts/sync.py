@@ -429,6 +429,121 @@ def upload_shared(
             )
 
 
+def normalize_shared_file(root: Path, value: Path) -> tuple[Path, str]:
+    """Return a local shared file and its snapshot-relative path."""
+    candidate = value.expanduser()
+    if not candidate.is_absolute():
+        parts = candidate.parts
+        candidate = root / candidate if parts and parts[0] == ".share" else root / ".share" / candidate
+    candidate = candidate.resolve()
+    shared = (root / ".share").resolve()
+    try:
+        candidate.relative_to(shared)
+    except ValueError as exc:
+        raise SyncError(f"只能发布 .agents/.share 下的文件：{candidate}") from exc
+    if not candidate.is_file():
+        raise SyncError(f"待发布 shared 文件不存在：{candidate}")
+    relative = candidate.relative_to(root.resolve()).as_posix()
+    if relative.split("/", 2)[1] not in SHARED_DIRS:
+        raise SyncError(f"不支持的 shared 文件路径：{relative}")
+    return candidate, relative
+
+
+def publish_shared_file(
+    root: Path,
+    config: dict[str, Any],
+    value: Path,
+    *,
+    dry_run: bool,
+    allow_non_writer: bool,
+) -> None:
+    """Publish one evaluator-owned shared file without overwriting other writers.
+
+    Remote changes to every other shared file are pulled into the local snapshot.
+    A concurrent change to the same file, or unrelated uncommitted local shared
+    changes, is rejected instead of being silently overwritten.
+    """
+    require_shared_writer(config, allow_non_writer=allow_non_writer)
+    local_file, relative = normalize_shared_file(root, value)
+    sync = config["sync"]
+    clear_proxy = bool(sync.get("clear_proxy"))
+    if dry_run:
+        print(f"DRY-RUN: publish only {relative} and pull other remote shared changes")
+        return
+
+    with shared_lock(root), tempfile.TemporaryDirectory(prefix="agent-shared-file-") as temporary:
+        temporary_root = Path(temporary)
+        local_snapshot = temporary_root / "local"
+        remote_snapshot = temporary_root / "remote"
+        merged_snapshot = temporary_root / "merged"
+        copy_shared_snapshot(root, local_snapshot)
+        download_shared(
+            sync["remote"],
+            remote_snapshot,
+            clear_proxy=clear_proxy,
+            dry_run=False,
+        )
+
+        base_path = shared_base(root)
+        if not base_path.is_dir():
+            raise SyncError("shared 尚无同步基线；请先运行 sync-shared")
+        base = shared_manifest(base_path)
+        local = shared_manifest(local_snapshot)
+        remote = shared_manifest(remote_snapshot)
+        unrelated_local = [path for path in changed_paths(base, local) if path != relative]
+        if unrelated_local:
+            raise SyncError(
+                "本地还有其他未发布 shared 修改，拒绝文件级发布："
+                + ", ".join(unrelated_local)
+            )
+        if base.get(relative) != remote.get(relative) and local.get(relative) != remote.get(relative):
+            conflict = save_shared_conflict(
+                root,
+                remote_snapshot=remote_snapshot,
+                base_manifest=base,
+                local_manifest=local,
+                remote_manifest=remote,
+            )
+            raise SyncError(
+                f"远端同一 shared 文件已并发修改：{relative}；请合并 {conflict / 'remote'}"
+            )
+
+        # H1 加固（2026-08-12 审计）：远端缺少 base 中已有文件（旧版覆盖/删除
+        # 特征）时拒绝合并——merged 以 remote 为底，缺文件会被 install 覆盖掉本地。
+        missing_in_remote = sorted(set(base) - set(remote))
+        if missing_in_remote:
+            conflict = save_shared_conflict(
+                root,
+                remote_snapshot=remote_snapshot,
+                base_manifest=base,
+                local_manifest=local,
+                remote_manifest=remote,
+            )
+            preview = ", ".join(missing_in_remote[:10])
+            if len(missing_in_remote) > 10:
+                preview += f" 等 {len(missing_in_remote)} 个"
+            raise SyncError(
+                "远端缺少本地已有的 shared 文件（疑似远端被旧版覆盖/删除）："
+                f"{preview}；已保存远端快照 {conflict / 'remote'}，"
+                "请人工确认（正常删除则接受）后运行 resolve-shared"
+            )
+        copy_shared_snapshot(remote_snapshot, merged_snapshot)
+        merged_file = merged_snapshot / relative
+        merged_file.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copy2(local_file, merged_file)
+        if local.get(relative) != remote.get(relative):
+            copy_object(
+                local_file,
+                remote_path(sync["remote"], relative.removeprefix(".share/")),
+                clear_proxy=clear_proxy,
+                dry_run=False,
+            )
+        install_shared_snapshot(root, merged_snapshot)
+        update_shared_base(root, merged_snapshot)
+        clear_shared_conflict(root)
+    print(f"已发布 shared 文件：{relative}")
+
+
 def reconcile_shared(
     root: Path,
     config: dict[str, Any],
@@ -519,6 +634,26 @@ def reconcile_shared(
             )
 
         if remote_changed:
+            # 2026-08-12 加固（13:13 事故）：远端缺少本地（==基线）已有的
+            # 文件，疑似远端被旧版覆盖或删除——拒绝无条件拉取，保存远端快照
+            # 人工确认（正常删除也走此路径，确认后 resolve-shared 接受删除）。
+            missing_in_remote = sorted(set(base) - set(remote))
+            if missing_in_remote:
+                conflict = save_shared_conflict(
+                    root,
+                    remote_snapshot=remote_snapshot,
+                    base_manifest=base,
+                    local_manifest=local,
+                    remote_manifest=remote,
+                )
+                preview = ", ".join(missing_in_remote[:10])
+                if len(missing_in_remote) > 10:
+                    preview += f" 等 {len(missing_in_remote)} 个"
+                raise SyncError(
+                    "远端缺少本地已有的 shared 文件（疑似远端被旧版覆盖/删除）："
+                    f"{preview}；已保存远端快照 {conflict / 'remote'}，"
+                    "请人工确认（正常删除则接受）后运行 resolve-shared"
+                )
             install_shared_snapshot(root, remote_snapshot)
             update_shared_base(root, remote_snapshot)
             clear_shared_conflict(root)
@@ -570,6 +705,21 @@ def resolve_shared(
         )
         if shared_manifest(remote_snapshot) != report.get("remote_manifest"):
             raise SyncError("S3 shared 在合并期间再次变化；请重新运行 sync-shared 获取最新分叉")
+        # H2 加固（2026-08-12 审计）：resolve 是整包上传，若用户只合并了部分
+        # 冲突文件，远端新增（base 没有而远端有）未被并入本地——整包上传会把
+        # 远端真实更新覆盖回旧版。上传前确认远端新增均已进入本地。
+        base_manifest = report.get("base_manifest", {})
+        remote_manifest = shared_manifest(remote_snapshot)
+        local_manifest = shared_manifest(root)
+        unmerged = sorted(set(remote_manifest) - set(base_manifest) - set(local_manifest))
+        if unmerged:
+            preview = ", ".join(unmerged[:10])
+            if len(unmerged) > 10:
+                preview += f" 等 {len(unmerged)} 个"
+            raise SyncError(
+                "resolve 前请先合并远端新增文件到本地（当前缺失）："
+                f"{preview}；请从 {conflict / 'remote'} 补齐后再 resolve-shared"
+            )
         upload_shared(root, config, dry_run=False)
         local_snapshot = Path(temporary) / "local"
         copy_shared_snapshot(root, local_snapshot)
@@ -592,8 +742,12 @@ def ensure_link(path: Path, target: Path, *, dry_run: bool) -> None:
 
 def configure_agent_links(root: Path, config: dict[str, Any], *, dry_run: bool) -> None:
     skills_root = root / ".share" / "skills"
+    # 2026-08-12 skills 按 common/eval/memory/train 分类后为多级布局：
+    # 递归发现所有含 SKILL.md 的目录（父目录即 skill 名），跳过分类目录本身。
     skills = sorted(
-        path for path in skills_root.iterdir() if path.is_dir() and (path / "SKILL.md").is_file()
+        skill_path.parent
+        for skill_path in skills_root.rglob("SKILL.md")
+        if skill_path.parent != skills_root and skill_path.parent.is_dir()
     )
     if not skills:
         raise SyncError(f"共享 Skill 目录为空：{skills_root}")
@@ -794,6 +948,18 @@ def command_push_shared(root: Path, args: argparse.Namespace) -> int:
     return 0
 
 
+def command_publish_shared_file(root: Path, args: argparse.Namespace) -> int:
+    config = load_config(root)
+    publish_shared_file(
+        root,
+        config,
+        args.path,
+        dry_run=args.dry_run,
+        allow_non_writer=args.allow_non_writer,
+    )
+    return 0
+
+
 def command_sync_shared(root: Path, args: argparse.Namespace) -> int:
     config = load_config(root)
     reconcile_shared(
@@ -892,6 +1058,14 @@ def parser() -> argparse.ArgumentParser:
     push_shared = subparsers.add_parser("push-shared", help="检查分叉后上传 shared")
     add_writer_override(push_shared)
     push_shared.set_defaults(func=command_push_shared)
+
+    publish_file = subparsers.add_parser(
+        "publish-shared-file",
+        help="只发布一个有明确所有权的 shared 文件，并拉取其余远端更新",
+    )
+    publish_file.add_argument("path", type=Path)
+    add_writer_override(publish_file)
+    publish_file.set_defaults(func=command_publish_shared_file)
 
     sync_shared = subparsers.add_parser("sync-shared", help="双向协调 shared；分叉时拒绝覆盖")
     add_writer_override(sync_shared)

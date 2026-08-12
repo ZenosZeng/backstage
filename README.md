@@ -39,6 +39,7 @@
 │   └── prompts/
 ├── skills/
 ├── long-term/
+├── shared_files/
 └── memory/
     └── <machine>/<agent>/<UTC-date>.json
 ```
@@ -117,6 +118,10 @@ python3 scripts/sync.py pull-shared
 python3 scripts/sync.py push-shared
 python3 scripts/sync.py sync-shared
 python3 scripts/sync.py resolve-shared
+
+# 发布单个有明确所有权的共享文件，并拉取其他远端更新
+python3 scripts/sync.py publish-shared-file \
+  shared_files/b1k-docs/eval_report.md
 ```
 
 ## Shared 分叉保护
@@ -140,6 +145,10 @@ python3 scripts/sync.py resolve-shared
 `resolve-shared` 上传前会再次检查 S3。如果人工合并期间远端再次变化，操作会停止并要求重新合并。
 
 `--allow-non-writer` 仅用于用户明确授权的维护迁移，不会绕过分叉检测。
+
+`publish-shared-file` 用于 request/report 这类分属不同机器维护的文件：只上传
+指定文件，同时把远端其他文件合并到本地；若远端也修改了同一个文件则拒绝
+覆盖。它不适合发布 Skill、long-term 或一组相互依赖的共享文件。
 
 ## 测试
 

@@ -68,6 +68,16 @@ class SyncTest(unittest.TestCase):
             path.parent.mkdir(parents=True, exist_ok=True)
             path.write_text(content, encoding="utf-8")
 
+    def write_eval_docs(self, base: Path, request: str, report: str) -> None:
+        files = {
+            ".share/shared_files/b1k-docs/eval_request.yaml": request,
+            ".share/shared_files/b1k-docs/eval_report.md": report,
+        }
+        for relative, content in files.items():
+            path = base / relative
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_text(content, encoding="utf-8")
+
     def fake_download(self, source: Path):
         def download(_remote, destination, **_kwargs):
             SYNC.copy_shared_snapshot(source, Path(destination))
@@ -171,6 +181,65 @@ class SyncTest(unittest.TestCase):
             "workspace remote\n",
         )
 
+    def test_pull_rejects_remote_regression_with_missing_files(self) -> None:
+        """远端缺少本地已有的文件（旧版覆盖/删除特征）→ 拒绝拉取并保存快照。"""
+        self.write_shared(self.root, "base")
+        SYNC.update_shared_base(self.root, self.root)
+        remote = Path(self.temporary.name) / "remote-shared"
+        # 远端只有部分文件（缺 _workspace.md 与 CLAUDE.md → 回退特征）
+        remote_files = {
+            ".share/config/prompts/AGENTS.md": "agents remote\n",
+            ".share/long-term/_workspace.md": "workspace base\n",
+            ".share/skills/memory/SKILL.md": "skill base\n",
+        }
+        for relative, content in remote_files.items():
+            path = remote / relative
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_text(content, encoding="utf-8")
+        # 远端缺 CLAUDE.md（本地/基线有，未写入即缺失）
+
+        with (
+            mock.patch.object(SYNC, "download_shared", side_effect=self.fake_download(remote)),
+            self.assertRaisesRegex(SYNC.SyncError, "远端缺少本地已有的 shared 文件"),
+        ):
+            SYNC.reconcile_shared(
+                self.root,
+                self.config,
+                mode="both",
+                dry_run=False,
+                allow_non_writer=False,
+            )
+        # 本地未被覆盖（CLAUDE.md 还在），冲突快照已保存
+        self.assertTrue((self.root / ".share" / "config" / "prompts" / "CLAUDE.md").is_file())
+        self.assertTrue((SYNC.shared_conflict(self.root) / "report.json").is_file())
+        self.assertTrue(
+            (SYNC.shared_conflict(self.root) / "remote" / ".share" / "config" / "prompts" / "CLAUDE.md").exists()
+            is False
+        )
+
+    def test_pull_accepts_remote_forward_addition(self) -> None:
+        """远端新增文件（向前变更）→ 正常拉取。"""
+        self.write_shared(self.root, "base")
+        SYNC.update_shared_base(self.root, self.root)
+        remote = Path(self.temporary.name) / "remote-shared"
+        self.write_shared(remote, "remote")
+        extra = remote / ".share" / "shared_files" / "new_doc.md"
+        extra.parent.mkdir(parents=True, exist_ok=True)
+        extra.write_text("new doc\n", encoding="utf-8")
+
+        with mock.patch.object(SYNC, "download_shared", side_effect=self.fake_download(remote)):
+            SYNC.reconcile_shared(
+                self.root,
+                self.config,
+                mode="both",
+                dry_run=False,
+                allow_non_writer=False,
+            )
+        self.assertEqual(
+            (self.root / ".share" / "shared_files" / "new_doc.md").read_text(encoding="utf-8"),
+            "new doc\n",
+        )
+
     def test_remote_only_shared_change_is_pulled(self) -> None:
         self.write_shared(self.root, "base")
         SYNC.update_shared_base(self.root, self.root)
@@ -257,6 +326,95 @@ class SyncTest(unittest.TestCase):
         self.assertIn(".share/long-term/_workspace.md", report["local_changes"])
         self.assertIn(".share/long-term/_workspace.md", report["remote_changes"])
 
+    def test_publish_shared_file_merges_remote_request_and_local_report(self) -> None:
+        self.write_shared(self.root, "base")
+        self.write_eval_docs(self.root, "request base\n", "report base\n")
+        SYNC.update_shared_base(self.root, self.root)
+        (self.root / ".share/shared_files/b1k-docs/eval_report.md").write_text(
+            "report local\n", encoding="utf-8"
+        )
+        remote = Path(self.temporary.name) / "remote-file-publish"
+        self.write_shared(remote, "base")
+        self.write_eval_docs(remote, "request remote\n", "report base\n")
+
+        with (
+            mock.patch.object(SYNC, "download_shared", side_effect=self.fake_download(remote)),
+            mock.patch.object(SYNC, "copy_object") as copy,
+        ):
+            SYNC.publish_shared_file(
+                self.root,
+                self.config,
+                Path("shared_files/b1k-docs/eval_report.md"),
+                dry_run=False,
+                allow_non_writer=False,
+            )
+
+        copy.assert_called_once()
+        self.assertEqual(
+            (self.root / ".share/shared_files/b1k-docs/eval_request.yaml").read_text(),
+            "request remote\n",
+        )
+        self.assertEqual(
+            (self.root / ".share/shared_files/b1k-docs/eval_report.md").read_text(),
+            "report local\n",
+        )
+
+    def test_publish_shared_file_rejects_concurrent_report_change(self) -> None:
+        self.write_shared(self.root, "base")
+        self.write_eval_docs(self.root, "request base\n", "report base\n")
+        SYNC.update_shared_base(self.root, self.root)
+        (self.root / ".share/shared_files/b1k-docs/eval_report.md").write_text(
+            "report local\n", encoding="utf-8"
+        )
+        remote = Path(self.temporary.name) / "remote-file-conflict"
+        self.write_shared(remote, "base")
+        self.write_eval_docs(remote, "request base\n", "report remote\n")
+
+        with (
+            mock.patch.object(SYNC, "download_shared", side_effect=self.fake_download(remote)),
+            self.assertRaisesRegex(SYNC.SyncError, "同一 shared 文件"),
+        ):
+            SYNC.publish_shared_file(
+                self.root,
+                self.config,
+                Path("shared_files/b1k-docs/eval_report.md"),
+                dry_run=False,
+                allow_non_writer=False,
+            )
+
+    def test_resolve_refuses_unmerged_remote_additions(self) -> None:
+        """resolve 前远端新增未并入本地（用户只合了部分冲突）→ 拒绝整包上传。"""
+        self.write_shared(self.root, "base")
+        SYNC.update_shared_base(self.root, self.root)
+        (self.root / ".share" / "long-term" / "_workspace.md").write_text(
+            "workspace local\n", encoding="utf-8"
+        )
+        remote = Path(self.temporary.name) / "remote-shared"
+        self.write_shared(remote, "remote")
+        # 远端新增一个文件（base 没有）——分叉前就存在，report 快照含它
+        extra = remote / ".share" / "shared_files" / "new_doc.md"
+        extra.parent.mkdir(parents=True, exist_ok=True)
+        extra.write_text("remote new\n", encoding="utf-8")
+        with (
+            mock.patch.object(SYNC, "download_shared", side_effect=self.fake_download(remote)),
+            self.assertRaises(SYNC.SyncError),
+        ):
+            SYNC.reconcile_shared(
+                self.root,
+                self.config,
+                mode="both",
+                dry_run=False,
+                allow_non_writer=False,
+            )
+        # 本地未合并 new_doc.md，直接 resolve → 应被 H2 拒绝
+        with (
+            mock.patch.object(SYNC, "download_shared", side_effect=self.fake_download(remote)),
+            mock.patch.object(SYNC, "upload_shared") as upload,
+            self.assertRaisesRegex(SYNC.SyncError, "请先合并远端新增文件"),
+        ):
+            SYNC.resolve_shared(self.root, self.config, dry_run=False, allow_non_writer=False)
+        upload.assert_not_called()
+
     def test_resolve_refuses_when_remote_changed_again(self) -> None:
         self.write_shared(self.root, "base")
         SYNC.update_shared_base(self.root, self.root)
@@ -341,10 +499,17 @@ class SyncTest(unittest.TestCase):
         home = Path(self.temporary.name) / "home"
         workspace = Path(self.temporary.name) / "workspace"
         self.config["workspace_root"] = str(workspace)
-        for name in ("memory", "update-workspace-memory"):
-            skill = self.root / ".share" / "skills" / name
-            skill.mkdir(parents=True, exist_ok=True)
-            (skill / "SKILL.md").write_text(f"# {name}\n", encoding="utf-8")
+        # 2026-08-12：skills 分类布局（common/eval/memory/train），递归发现
+        for category, names in (
+            ("common", ("kimi-invoke",)),
+            ("eval", ("analyze-b1k-eval", "sync-b1k-eval-request")),
+            ("memory", ("check-memory", "memory", "write-work-report")),
+            ("train", ("upload-pi-checkpoint",)),
+        ):
+            for name in names:
+                skill = self.root / ".share" / "skills" / category / name
+                skill.mkdir(parents=True, exist_ok=True)
+                (skill / "SKILL.md").write_text(f"# {name}\n", encoding="utf-8")
         prompts = self.root / ".share" / "config" / "prompts"
         prompts.mkdir(parents=True, exist_ok=True)
         (prompts / "AGENTS.md").write_text("agents\n", encoding="utf-8")
@@ -353,11 +518,23 @@ class SyncTest(unittest.TestCase):
         with mock.patch.object(SYNC.Path, "home", return_value=home):
             SYNC.configure_agent_links(self.root, self.config, dry_run=False)
 
+        expected = {
+            "kimi-invoke": "common/kimi-invoke",
+            "analyze-b1k-eval": "eval/analyze-b1k-eval",
+            "sync-b1k-eval-request": "eval/sync-b1k-eval-request",
+            "check-memory": "memory/check-memory",
+            "memory": "memory/memory",
+            "write-work-report": "memory/write-work-report",
+            "upload-pi-checkpoint": "train/upload-pi-checkpoint",
+        }
         for agent_home in (".codex", ".claude", ".kimi-code"):
-            for name in ("memory", "update-workspace-memory"):
+            for name, relative in expected.items():
                 link = home / agent_home / "skills" / name
-                self.assertTrue(link.is_symlink())
-                self.assertEqual(link.resolve(), (self.root / ".share" / "skills" / name).resolve())
+                self.assertTrue(link.is_symlink(), f"{link} missing for {name}")
+                self.assertEqual(
+                    link.resolve(),
+                    (self.root / ".share" / "skills" / relative).resolve(),
+                )
         self.assertEqual((workspace / "AGENTS.md").resolve(), (prompts / "AGENTS.md").resolve())
         self.assertEqual((workspace / "CLAUDE.md").resolve(), (prompts / "CLAUDE.md").resolve())
 
@@ -395,6 +572,7 @@ class SyncTest(unittest.TestCase):
                 "sync",
                 "pull-shared",
                 "push-shared",
+                "publish-shared-file",
                 "sync-shared",
                 "resolve-shared",
                 "status",
