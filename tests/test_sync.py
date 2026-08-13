@@ -546,6 +546,7 @@ class SyncTest(unittest.TestCase):
             mock.patch.object(SYNC, "push_memory") as push_memory,
             mock.patch.object(SYNC, "pull_other_memory") as pull_memory,
             mock.patch.object(SYNC, "reconcile_shared") as shared,
+            mock.patch.object(SYNC, "configure_agent_links") as links,
         ):
             result = SYNC.command_sync(self.root, args)
         self.assertEqual(result, 0)
@@ -558,6 +559,32 @@ class SyncTest(unittest.TestCase):
             dry_run=False,
             allow_non_writer=False,
         )
+        links.assert_called_once_with(self.root, self.config, dry_run=False, strict=False)
+
+    def test_sync_links_skip_conflicting_real_dirs(self) -> None:
+        # 非严格模式（sync/pull）：某 agent home 已有同名真实目录时警告跳过，
+        # 不阻断同步；其余链接正常建立。
+        home = Path(self.temporary.name) / "home"
+        workspace = Path(self.temporary.name) / "workspace"
+        self.config["workspace_root"] = str(workspace)
+        skill = self.root / ".share" / "skills" / "eval" / "check-goai-eval-status"
+        skill.mkdir(parents=True, exist_ok=True)
+        (skill / "SKILL.md").write_text("# check-goai-eval-status\n", encoding="utf-8")
+        prompts = self.root / ".share" / "config" / "prompts"
+        prompts.mkdir(parents=True, exist_ok=True)
+        (prompts / "AGENTS.md").write_text("agents\n", encoding="utf-8")
+        (prompts / "CLAUDE.md").write_text("claude\n", encoding="utf-8")
+        conflict = home / ".codex" / "skills" / "check-goai-eval-status"
+        conflict.mkdir(parents=True)
+
+        with mock.patch.object(SYNC.Path, "home", return_value=home):
+            SYNC.configure_agent_links(self.root, self.config, dry_run=False, strict=False)
+
+        self.assertTrue(conflict.is_dir() and not conflict.is_symlink())
+        for agent_home in (".claude", ".kimi-code"):
+            link = home / agent_home / "skills" / "check-goai-eval-status"
+            self.assertTrue(link.is_symlink())
+        self.assertTrue((workspace / "AGENTS.md").is_symlink())
 
     def test_cli_exposes_explicit_shared_workflow(self) -> None:
         parser = SYNC.parser()

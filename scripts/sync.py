@@ -740,7 +740,7 @@ def ensure_link(path: Path, target: Path, *, dry_run: bool) -> None:
     path.symlink_to(target, target_is_directory=target.is_dir())
 
 
-def configure_agent_links(root: Path, config: dict[str, Any], *, dry_run: bool) -> None:
+def configure_agent_links(root: Path, config: dict[str, Any], *, dry_run: bool, strict: bool = True) -> None:
     skills_root = root / ".share" / "skills"
     # 2026-08-12 skills 按 common/eval/memory/train 分类后为多级布局：
     # 递归发现所有含 SKILL.md 的目录（父目录即 skill 名），跳过分类目录本身。
@@ -751,16 +751,22 @@ def configure_agent_links(root: Path, config: dict[str, Any], *, dry_run: bool) 
     )
     if not skills:
         raise SyncError(f"共享 Skill 目录为空：{skills_root}")
+    links: list[tuple[Path, Path]] = []
     for skill in skills:
         for agent_home in (".codex", ".claude", ".kimi-code"):
-            ensure_link(
-                Path.home() / agent_home / "skills" / skill.name,
-                skill,
-                dry_run=dry_run,
-            )
+            links.append((Path.home() / agent_home / "skills" / skill.name, skill))
     workspace = Path(os.path.expanduser(str(config["workspace_root"])))
-    ensure_link(workspace / "AGENTS.md", root / ".share" / "config" / "prompts" / "AGENTS.md", dry_run=dry_run)
-    ensure_link(workspace / "CLAUDE.md", root / ".share" / "config" / "prompts" / "CLAUDE.md", dry_run=dry_run)
+    links.append((workspace / "AGENTS.md", root / ".share" / "config" / "prompts" / "AGENTS.md"))
+    links.append((workspace / "CLAUDE.md", root / ".share" / "config" / "prompts" / "CLAUDE.md"))
+    for path, target in links:
+        try:
+            ensure_link(path, target, dry_run=dry_run)
+        except SyncError as error:
+            # strict=False（sync/pull 路径）：单条链接冲突不阻断同步，
+            # 机器上已有同名真实配置时保留现状并提示。
+            if strict:
+                raise
+            print(f"[links] {error}", file=sys.stderr, flush=True)
 
 
 def build_local_config(
@@ -881,6 +887,8 @@ def command_pull(root: Path, args: argparse.Namespace) -> int:
         dry_run=args.dry_run,
         allow_non_writer=False,
     )
+    # 拉取后为新增 Skill 建立 agent 链接（已有同名真实配置则警告跳过）
+    configure_agent_links(root, config, dry_run=args.dry_run, strict=False)
     if not args.dry_run:
         validate_local_memory(root)
     return 0
@@ -919,6 +927,8 @@ def command_sync(root: Path, args: argparse.Namespace) -> int:
         dry_run=args.dry_run,
         allow_non_writer=False,
     )
+    # 同步后为新增 Skill 建立 agent 链接（已有同名真实配置则警告跳过）
+    configure_agent_links(root, config, dry_run=args.dry_run, strict=False)
     if not args.dry_run:
         validate_local_memory(root)
     return 0
@@ -933,6 +943,7 @@ def command_pull_shared(root: Path, args: argparse.Namespace) -> int:
         dry_run=args.dry_run,
         allow_non_writer=False,
     )
+    configure_agent_links(root, config, dry_run=args.dry_run, strict=False)
     return 0
 
 
