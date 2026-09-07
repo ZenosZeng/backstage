@@ -1,0 +1,10 @@
+{
+  "repo_root": "~/code/Pi",
+  "poll_seconds": 60,
+  "stall_warning_seconds": 900,
+  "stall_critical_seconds": 3600,
+  "quiet_hours": [0, 1, 2, 3, 4, 5, 6, 7, 13],
+  "kubectl_args": [],
+  "experiments": [],
+  "notify": true
+}

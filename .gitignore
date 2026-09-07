@@ -11,6 +11,8 @@
 /.pytest_cache/
 /.coverage
 /htmlcov/
+/.pixi/
+/.ruff_cache/
 
 # Editor and OS metadata
 .DS_Store

@@ -1,0 +1,32 @@
+[workspace]
+name = "agent-workspace"
+version = "0.1.0"
+description = "Memory, monitoring and remote Agent tools"
+channels = ["conda-forge"]
+platforms = ["linux-64"]
+
+[dependencies]
+python = ">=3.11,<3.12"
+
+[pypi-dependencies]
+lark-oapi = "==1.7.2"
+
+[tasks]
+memory = "python scripts/memory.py"
+sync = "python scripts/sync.py"
+watchdog-b1k = "python -m tools.watchdog b1k"
+watchdog-train = "python -m tools.watchdog train"
+claude-feishu = "python -m tools.claude_feishu"
+tools-status = "python -m tools.service --all-status"
+
+[feature.dev.dependencies]
+pytest = ">=8,<9"
+ruff = ">=0.11,<1"
+
+[feature.dev.tasks]
+test = "python -m pytest tests tools/tests -q"
+lint = "ruff check tools --select E9,F63,F7,F82"
+
+[environments]
+default = { features = [], solve-group = "tools" }
+dev = { features = ["dev"], solve-group = "tools" }
