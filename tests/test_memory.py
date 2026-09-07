@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import datetime as dt
 import subprocess
 import sys
 import tempfile
@@ -190,6 +191,119 @@ class MemoryCliTest(unittest.TestCase):
         self.assertEqual(result.returncode, 2)
         self.assertIn("疑似包含 secret", result.stderr)
         self.assertFalse((self.root / ".share" / "memory").exists())
+
+    def sample_event(self, event_id: str = "original", **changes) -> dict:
+        event = {
+            "schema_version": 1, "event_id": event_id,
+            "created_at": "2026-08-04T00:00:00Z", "machine_id": "other-machine",
+            "agent": "claude", "workspace": "code", "projects": [{"name": "repo-a"}],
+            "event_type": "fact", "topic_key": "tests/read", "title": "test",
+            "content": {"what": "old conclusion", "verified_by": ["unit test"]},
+            "status": "active", "supersedes": [],
+        }
+        event.update(changes)
+        return event
+
+    def import_events(self, events: list[dict], *, check=True):
+        path = Path(self.temporary.name) / "events.json"
+        path.write_text(json.dumps(events), encoding="utf-8")
+        return self.run_cli("import", "--input", str(path), check=check)
+
+    def test_conflicting_id_rejects_entire_import_without_writes(self):
+        self.import_events([self.sample_event()])
+        before = {str(p): p.read_bytes() for p in (self.root / ".share").rglob("*.json")}
+        result = self.import_events([
+            self.sample_event("new", created_at="2026-08-05T00:00:00Z"),
+            self.sample_event(content={"what": "different"}),
+        ], check=False)
+        self.assertEqual(result.returncode, 2)
+        self.assertIn("冲突", result.stderr)
+        self.assertEqual(before, {str(p): p.read_bytes() for p in (self.root / ".share").rglob("*.json")})
+
+    def test_conflicting_id_in_other_date_is_rejected(self):
+        self.import_events([self.sample_event()])
+        result = self.import_events([self.sample_event(created_at="2026-08-05T00:00:00Z")], check=False)
+        self.assertEqual(result.returncode, 2)
+
+    def test_filters_and_utc_ordering(self):
+        self.import_events([
+            self.sample_event("a"),
+            self.sample_event("b", machine_id="machine-b", created_at="2026-08-04T08:30:00+08:00"),
+            self.sample_event("c", machine_id="machine-b", created_at="2026-08-04T02:00:00Z"),
+            self.sample_event("d", machine_id="machine-b", created_at="2026-08-05T00:00:00Z"),
+        ])
+        result = self.run_cli("recent", "--machine", "machine-b", "--topic", "tests/read", "--since", "2026-08-04", "--until", "2026-08-05", "--json")
+        self.assertEqual([e["event_id"] for e in json.loads(result.stdout)], ["c", "b"])
+        self.assertEqual(self.run_cli("recent", "--since", "2026-08-05", "--until", "2026-08-04", check=False).returncode, 2)
+        self.assertEqual(self.run_cli("recent", "--limit", "0", check=False).returncode, 2)
+
+    def test_current_filters_superseded_before_search_and_keeps_parallel_claims(self):
+        self.import_events([
+            self.sample_event("old"),
+            self.sample_event("new", agent="codex", supersedes=["old"], content={"what": "new result"}),
+            self.sample_event("parallel", content={"what": "independent result"}),
+        ])
+        old = self.run_cli("search", "old conclusion", "--agent", "claude", "--current", "--json")
+        self.assertEqual(json.loads(old.stdout), [])
+        current = self.run_cli("recent", "--current", "--json")
+        self.assertEqual({e["event_id"] for e in json.loads(current.stdout)}, {"new", "parallel"})
+        self.assertEqual(len(json.loads(self.run_cli("recent", "--json").stdout)), 3)
+
+    def test_get_and_audit_preserve_legacy_source(self):
+        event = self.sample_event(created_at="2026-08-04T08:00:00+08:00")
+        self.import_events([event])
+        path = next((self.root / ".share").rglob("*.json"))
+        document = json.loads(path.read_text())
+        document["events"][0]["created_at"] = "2026-08-05T08:00:00+08:00"
+        path.write_text(json.dumps(document))
+        self.run_cli("validate")
+        fetched = json.loads(self.run_cli("get", "original").stdout)
+        self.assertTrue(fetched["source"].endswith("2026-08-04.json"))
+        result = self.run_cli("audit", "--json", check=False)
+        self.assertEqual(result.returncode, 1)
+        self.assertEqual(set(json.loads(result.stdout)["counts"]), {"legacy_non_utc", "legacy_date_mismatch"})
+        self.assertEqual(self.run_cli("get", "absent", check=False).returncode, 1)
+
+    def test_audit_is_read_only_and_reports_unverified_stale_references(self):
+        old = (dt.datetime.now(dt.timezone.utc) - dt.timedelta(days=90)).isoformat()
+        self.import_events([self.sample_event(event_type="hypothesis", status="needs_verification", created_at=old, content={"what": "not tested"}, supersedes=["unknown"])])
+        before = {str(p): p.read_bytes() for p in (self.root / ".share").rglob("*.json")}
+        report = json.loads(self.run_cli("audit", "--json", check=False).stdout)
+        self.assertEqual(report["counts"], {"missing_source": 1, "dangling_supersedes": 1, "stale_candidate": 1})
+        self.assertEqual(before, {str(p): p.read_bytes() for p in (self.root / ".share").rglob("*.json")})
+
+    def test_audit_preserves_parallel_superseding_decisions(self):
+        self.import_events([self.sample_event("base"), self.sample_event("a", supersedes=["base"]), self.sample_event("b", supersedes=["base"])])
+        report = json.loads(self.run_cli("audit", "--json", check=False).stdout)
+        self.assertEqual(report["counts"], {"parallel_supersedes_candidate": 2})
+
+    def test_invalid_schema_is_rejected(self):
+        for changes in ({"schema_version": 2}, {"event_id": []}, {"supersedes": "id"}, {"supersedes": ["original"]}, {"created_at": "2026-08-04T00:00:00"}):
+            with self.subTest(changes=changes):
+                self.assertEqual(self.import_events([self.sample_event(**changes)], check=False).returncode, 2)
+        self.assertFalse((self.root / ".share" / "memory").exists())
+
+    def test_daily_envelope_mismatch_is_rejected(self):
+        self.import_events([self.sample_event()])
+        path = next((self.root / ".share").rglob("*.json"))
+        document = json.loads(path.read_text())
+        document["machine_id"] = "wrong-machine"
+        path.write_text(json.dumps(document))
+        self.assertEqual(self.run_cli("validate", check=False).returncode, 1)
+
+    def test_supersedes_cycle_is_visible_and_current_refuses_to_guess(self):
+        self.import_events([self.sample_event("a", supersedes=["b"]), self.sample_event("b", supersedes=["a"])])
+        report = json.loads(self.run_cli("audit", "--json", check=False).stdout)
+        self.assertEqual(report["counts"], {"supersedes_cycle": 2})
+        self.assertEqual(self.run_cli("recent", "--current", check=False).returncode, 2)
+        self.assertEqual(len(json.loads(self.run_cli("recent", "--json").stdout)), 2)
+
+    def test_plain_text_token_is_rejected_without_echo(self):
+        token = "ghp_" + "A" * 36
+        result = self.import_events([self.sample_event(token, content={"what": token})], check=False)
+        self.assertEqual(result.returncode, 2)
+        self.assertNotIn(token, result.stdout + result.stderr)
+        self.assertFalse((self.root / ".share/memory").exists())
 
 
 if __name__ == "__main__":

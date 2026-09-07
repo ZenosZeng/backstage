@@ -3,6 +3,9 @@ from __future__ import annotations
 import importlib.util
 import json
 import shutil
+import sys
+import threading
+import time
 import tempfile
 import unittest
 from argparse import Namespace
@@ -14,6 +17,7 @@ SCRIPT = Path(__file__).resolve().parents[1] / "scripts" / "sync.py"
 SPEC = importlib.util.spec_from_file_location("workspace_memory_sync", SCRIPT)
 assert SPEC and SPEC.loader
 SYNC = importlib.util.module_from_spec(SPEC)
+sys.path.insert(0, str(SCRIPT.parent))
 SPEC.loader.exec_module(SYNC)
 
 
@@ -23,7 +27,14 @@ def daily(machine: str, agent: str, marker: str) -> dict:
         "machine_id": machine,
         "agent": agent,
         "date": "2026-08-05",
-        "events": [{"event_id": marker}],
+        "events": [{
+            "schema_version": 1, "event_id": marker,
+            "created_at": "2026-08-05T00:00:00Z", "machine_id": machine,
+            "agent": agent, "workspace": "code", "projects": [],
+            "event_type": "fact", "topic_key": "tests/sync", "title": marker,
+            "content": {"what": "test", "verified_by": ["unit test"]},
+            "status": "active",
+        }],
     }
 
 
@@ -107,10 +118,15 @@ class SyncTest(unittest.TestCase):
     def test_push_memory_uploads_only_current_machine(self) -> None:
         self.write_daily(self.root / ".share" / "memory", "machine-a", "codex", "local")
         self.write_daily(self.root / ".share" / "memory", "machine-b", "claude", "cached")
-        with mock.patch.object(SYNC, "mirror") as mirror:
+        captured = []
+        def capture(source, target, **_kwargs):
+            captured.extend(Path(source).glob("*/*.json"))
+            self.assertEqual(len(captured), 1)
+            self.assertEqual(json.loads(captured[0].read_text())["machine_id"], "machine-a")
+        with mock.patch.object(SYNC, "mirror", side_effect=capture) as mirror:
             SYNC.push_memory(self.root, self.config, dry_run=False)
         source, target = mirror.call_args.args
-        self.assertEqual(source, self.root / ".share" / "memory" / "machine-a")
+        self.assertNotEqual(source, self.root / ".share" / "memory" / "machine-a")
         self.assertEqual(target, "bos/bucket/agent-memory-v2/memory/machine-a")
 
     def test_pull_memory_preserves_owned_prefix(self) -> None:
@@ -136,6 +152,140 @@ class SyncTest(unittest.TestCase):
         )
         self.assertEqual(owned["events"][0]["event_id"], "local-new")
         self.assertEqual(other["events"][0]["event_id"], "remote-new")
+
+    def pull_from(self, remote: Path):
+        def download(_source, target, **_kwargs):
+            shutil.copytree(remote, Path(target), dirs_exist_ok=True)
+        with mock.patch.object(SYNC, "remote_has_objects", return_value=True), mock.patch.object(SYNC, "mirror", side_effect=download):
+            SYNC.pull_other_memory(self.root, self.config, dry_run=False)
+
+    def test_pull_is_idempotent_and_atomic_per_file(self):
+        remote = Path(self.temporary.name) / "remote"
+        self.write_daily(remote, "machine-b", "claude", "remote")
+        self.pull_from(remote)
+        path = self.root / ".share/memory/machine-b/claude/2026-08-05.json"
+        before = path.read_bytes()
+        with mock.patch.object(SYNC, "atomic_write_json", wraps=SYNC.atomic_write_json) as write:
+            self.pull_from(remote)
+        write.assert_not_called()
+        self.assertEqual(path.read_bytes(), before)
+
+    def test_pull_rejects_raw_rollback_and_keeps_all_local_files(self):
+        local = self.write_daily(self.root / ".share/memory", "machine-b", "claude", "local")
+        remote = Path(self.temporary.name) / "remote"
+        self.write_daily(remote, "machine-b", "claude", "remote")
+        self.write_daily(remote, "machine-c", "codex", "new-machine")
+        before = local.read_bytes()
+        with self.assertRaisesRegex(SYNC.SyncError, "回退或改写"):
+            self.pull_from(remote)
+        self.assertEqual(local.read_bytes(), before)
+        self.assertFalse((self.root / ".share/memory/machine-c").exists())
+        report = json.loads((self.root / ".local/.sync/raw-conflict.json").read_text())
+        self.assertEqual(report["missing_ids"], ["local"])
+        self.assertNotIn("content", report)
+
+    def test_pull_rejects_same_id_content_change(self):
+        local = self.write_daily(self.root / ".share/memory", "machine-b", "claude", "id")
+        remote = Path(self.temporary.name) / "remote"
+        path = self.write_daily(remote, "machine-b", "claude", "id")
+        document = json.loads(path.read_text())
+        document["events"][0]["content"]["what"] = "changed"
+        path.write_text(json.dumps(document))
+        before = local.read_bytes()
+        with self.assertRaisesRegex(SYNC.SyncError, "冲突 1"):
+            self.pull_from(remote)
+        self.assertEqual(local.read_bytes(), before)
+
+    def test_pull_validates_every_file_before_install(self):
+        remote = Path(self.temporary.name) / "remote"
+        self.write_daily(remote, "machine-b", "codex", "valid")
+        bad = self.write_daily(remote, "machine-c", "claude", "bad")
+        document = json.loads(bad.read_text())
+        document["events"][0]["content"]["token"] = "test-only-secret"
+        bad.write_text(json.dumps(document))
+        with self.assertRaisesRegex(SYNC.SyncError, "secret"):
+            self.pull_from(remote)
+        self.assertFalse((self.root / ".share/memory/machine-b").exists())
+
+    def test_pull_rejects_duplicate_ids_across_machines(self):
+        remote = Path(self.temporary.name) / "remote"
+        self.write_daily(remote, "machine-b", "codex", "same")
+        self.write_daily(remote, "machine-c", "claude", "same")
+        with self.assertRaisesRegex(SYNC.SyncError, "重复"):
+            self.pull_from(remote)
+
+    def test_restore_machine_imports_owned_history_only_when_explicit(self):
+        remote = Path(self.temporary.name) / "remote"
+        self.write_daily(remote, "machine-a", "codex", "history")
+        def download(_source, target, **_kwargs):
+            shutil.copytree(remote, Path(target), dirs_exist_ok=True)
+        with mock.patch.object(SYNC, "remote_has_objects", return_value=True), mock.patch.object(SYNC, "mirror", side_effect=download):
+            SYNC.pull_other_memory(self.root, self.config, dry_run=False, include_owned=True)
+        restored = self.root / ".share/memory/machine-a/codex/2026-08-05.json"
+        self.assertEqual(json.loads(restored.read_text())["events"][0]["event_id"], "history")
+
+    def test_push_snapshot_does_not_block_append_or_include_temp_files(self):
+        original = self.write_daily(self.root / ".share/memory", "machine-a", "codex", "one")
+        original.with_name(".uncommitted.tmp").write_text("partial")
+        original.with_name(".partial.json.tmp").write_text("partial")
+        new_event = daily("machine-a", "codex", "two")["events"][0]
+        def upload(source, _target, **_kwargs):
+            # A subprocess writer would deadlock here if the network phase held memory-write.
+            result = []
+            writer = threading.Thread(target=lambda: result.append(SYNC.memory_store.append_events(self.root, [new_event])))
+            writer.start()
+            writer.join(timeout=3)
+            self.assertFalse(writer.is_alive())
+            self.assertEqual(result, [(1, 0)])
+            files = list(Path(source).rglob("*"))
+            self.assertEqual([p.name for p in files if p.is_file()], ["2026-08-05.json"])
+            self.assertEqual(len(json.loads((Path(source) / "codex/2026-08-05.json").read_text())["events"]), 1)
+        with mock.patch.object(SYNC, "mirror", side_effect=upload):
+            SYNC.push_memory(self.root, self.config, dry_run=False)
+        self.assertEqual(len(json.loads(original.read_text())["events"]), 2)
+
+    def test_failed_push_retains_events_and_retries(self):
+        local = self.write_daily(self.root / ".share/memory", "machine-a", "codex", "one")
+        before = local.read_bytes()
+        with mock.patch.object(SYNC, "mirror", side_effect=SYNC.SyncError("offline")):
+            with self.assertRaisesRegex(SYNC.SyncError, "offline"):
+                SYNC.push_memory(self.root, self.config, dry_run=False)
+        self.assertEqual(local.read_bytes(), before)
+        with mock.patch.object(SYNC, "mirror") as upload:
+            SYNC.push_memory(self.root, self.config, dry_run=False)
+        upload.assert_called_once()
+
+    def test_concurrent_pushes_cannot_upload_in_reverse_order(self):
+        self.write_daily(self.root / ".share/memory", "machine-a", "codex", "one")
+        entered, release = threading.Event(), threading.Event()
+        counts, errors = [], []
+        def upload(source, _target, **_kwargs):
+            counts.append(len(json.loads((Path(source) / "codex/2026-08-05.json").read_text())["events"]))
+            if len(counts) == 1:
+                entered.set()
+                release.wait(timeout=3)
+        def push():
+            try:
+                SYNC.push_memory(self.root, self.config, dry_run=False)
+            except Exception as exc:
+                errors.append(exc)
+        with mock.patch.object(SYNC, "mirror", side_effect=upload):
+            first = threading.Thread(target=push)
+            second = threading.Thread(target=push)
+            first.start()
+            try:
+                self.assertTrue(entered.wait(timeout=3))
+                SYNC.memory_store.append_events(self.root, daily("machine-a", "codex", "two")["events"])
+                second.start()
+                time.sleep(0.05)
+                self.assertEqual(counts, [1])
+            finally:
+                release.set()
+                first.join(timeout=4)
+                if second.ident is not None:
+                    second.join(timeout=4)
+        self.assertFalse(errors)
+        self.assertEqual(counts, [1, 2])
 
     def test_first_shared_pull_installs_remote_when_local_is_empty(self) -> None:
         remote = Path(self.temporary.name) / "remote-shared"
@@ -510,6 +660,8 @@ class SyncTest(unittest.TestCase):
                 skill = self.root / ".share" / "skills" / category / name
                 skill.mkdir(parents=True, exist_ok=True)
                 (skill / "SKILL.md").write_text(f"# {name}\n", encoding="utf-8")
+        # A legacy category copy must not steal the nested skill's symlink.
+        (self.root / ".share/skills/memory/SKILL.md").write_text("# legacy\n")
         prompts = self.root / ".share" / "config" / "prompts"
         prompts.mkdir(parents=True, exist_ok=True)
         (prompts / "AGENTS.md").write_text("agents\n", encoding="utf-8")

@@ -44,6 +44,8 @@ SENSITIVE_KEYS = {
 SECRET_PATTERNS = (
     re.compile(r"AKIA[0-9A-Z]{16}"),
     re.compile(r"-----BEGIN [A-Z ]*PRIVATE KEY-----"),
+    re.compile(r"\bgh[pousr]_[A-Za-z0-9]{36,}\b"),
+    re.compile(r"\bsk-(?:proj-)?[A-Za-z0-9_-]{20,}\b"),
 )
 SAFE_NAME = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.-]*$")
 
@@ -137,6 +139,13 @@ def event_projects(event: dict[str, Any]) -> list[dict[str, Any]]:
 
 
 def normalize_event(event: dict[str, Any]) -> dict[str, Any]:
+    if not isinstance(event, dict):
+        raise ValueError("event 必须是 object")
+    projects = event.get("projects", event.get("repos", []))
+    if not isinstance(projects, list) or any(
+        not isinstance(item, (str, dict)) for item in projects
+    ):
+        raise ValueError("projects/repos 必须是 project name 或 object 的 array")
     value = dict(event)
     value["projects"] = event_projects(value)
     value.pop("repos", None)
@@ -180,27 +189,82 @@ def validate_event(event: dict[str, Any]) -> list[str]:
     for key in required:
         if key not in event:
             errors.append(f"缺少字段 {key}")
-    if event.get("event_type") not in EVENT_TYPES:
-        errors.append(f"未知 event_type：{event.get('event_type')}")
-    if event.get("status") not in STATUSES:
-        errors.append(f"未知 status：{event.get('status')}")
+    if type(event.get("schema_version")) is not int or event["schema_version"] != 1:
+        errors.append("仅支持 schema_version=1")
+    for key in ("event_id", "title", "topic_key", "workspace"):
+        if not isinstance(event.get(key), str) or not event[key].strip():
+            errors.append(f"{key} 必须是非空字符串")
+    if not isinstance(event.get("event_type"), str) or event["event_type"] not in EVENT_TYPES:
+        errors.append("未知 event_type")
+    if not isinstance(event.get("status"), str) or event["status"] not in STATUSES:
+        errors.append("未知 status")
     if event.get("event_type") == "hypothesis" and event.get("status") != "needs_verification":
         errors.append("hypothesis 必须使用 needs_verification 状态")
     for key in ("machine_id", "agent"):
-        value = str(event.get(key, ""))
-        if not SAFE_NAME.fullmatch(value):
+        value = event.get(key, "")
+        if not isinstance(value, str) or not SAFE_NAME.fullmatch(value):
             errors.append(f"{key} 格式无效")
     try:
-        dt.datetime.fromisoformat(str(event.get("created_at", "")).replace("Z", "+00:00"))
+        parse_time(str(event.get("created_at", "")))
     except ValueError:
         errors.append("created_at 不是有效 ISO-8601 时间")
     if not isinstance(event.get("content"), dict):
         errors.append("content 必须是 object")
     if not isinstance(event.get("projects"), list):
         errors.append("projects 必须是 array")
+    supersedes = event.get("supersedes", [])
+    if not isinstance(supersedes, list) or any(
+        not isinstance(item, str) or not item for item in supersedes
+    ):
+        errors.append("supersedes 必须是非空 event_id 的 array")
+    elif event.get("event_id") in supersedes:
+        errors.append("事件不能 supersede 自己")
     if contains_sensitive_value(event):
         errors.append("事件疑似包含 secret")
     return errors
+
+
+def parse_time(value: str) -> dt.datetime:
+    parsed = dt.datetime.fromisoformat(value.replace("Z", "+00:00"))
+    if parsed.tzinfo is None:
+        raise ValueError("时间必须包含时区")
+    return parsed.astimezone(dt.timezone.utc)
+
+
+def read_daily(path: Path) -> dict[str, Any]:
+    document = read_json(path)
+    machine, agent, filename = path.parts[-3:]
+    dt.date.fromisoformat(filename.removesuffix(".json"))
+    if not isinstance(document, dict) or not isinstance(document.get("events"), list):
+        raise ValueError(f"daily JSON 格式无效：{path}")
+    if type(document.get("schema_version")) is not int or document["schema_version"] != 1 or (
+        document.get("machine_id"), document.get("agent"), document.get("date")
+    ) != (machine, agent, filename.removesuffix(".json")):
+        raise ValueError(f"daily JSON 身份或日期不匹配：{path}")
+    seen = set()
+    for raw in document["events"]:
+        event = normalize_event(raw)
+        errors = validate_event(event)
+        if errors:
+            raise ValueError(f"daily JSON 事件校验失败：{path}：{'；'.join(errors)}")
+        if (event["machine_id"], event["agent"]) != (machine, agent):
+            raise ValueError(f"事件与 daily JSON 身份不匹配：{path}")
+        if event["event_id"] in seen:
+            raise ValueError(f"daily JSON 包含重复 event_id：{path}")
+        seen.add(event["event_id"])
+    return document
+
+
+@contextmanager
+def operation_lock(root: Path, name: str) -> Iterator[None]:
+    path = root / ".local" / ".locks" / f"{name}.lock"
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with path.open("a", encoding="utf-8") as handle:
+        fcntl.flock(handle.fileno(), fcntl.LOCK_EX)
+        try:
+            yield
+        finally:
+            fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
 
 
 def daily_path(root: Path, event: dict[str, Any]) -> Path:
@@ -235,22 +299,38 @@ def atomic_write_json(path: Path, value: Any) -> None:
 
 
 def append_events(root: Path, events: list[dict[str, Any]]) -> tuple[int, int]:
+    # Serialize local imports with pull installation, but never hold this lock during S3 I/O.
+    with operation_lock(root, "memory-write"):
+        return _append_events(root, events)
+
+
+def _append_events(root: Path, events: list[dict[str, Any]]) -> tuple[int, int]:
+    stored, errors = load_events(root)
+    if errors:
+        raise ValueError("现有记忆校验失败，请先运行 validate")
+    existing = {event["event_id"]: event for event in stored}
     grouped: dict[Path, list[dict[str, Any]]] = {}
+    duplicates = 0
     for raw in events:
         event = normalize_event(raw)
         errors = validate_event(event)
         if errors:
-            raise ValueError(f"{event.get('event_id', '<unknown>')}：{'；'.join(errors)}")
+            raise ValueError(f"事件校验失败：{'；'.join(errors)}")
+        if event["event_id"] in existing:
+            if existing[event["event_id"]] != event:
+                raise ValueError("event_id 内容冲突，拒绝覆盖；请使用新 ID 和 supersedes")
+            duplicates += 1
+            continue
+        existing[event["event_id"]] = event
         grouped.setdefault(daily_path(root, event), []).append(event)
 
     added = 0
-    duplicates = 0
     for path, incoming in grouped.items():
         machine, agent, filename = path.parts[-3:]
         date = filename.removesuffix(".json")
         with file_lock(root, machine, agent, date):
             if path.exists():
-                document = read_json(path)
+                document = read_daily(path)
             else:
                 document = {
                     "schema_version": 1,
@@ -259,17 +339,8 @@ def append_events(root: Path, events: list[dict[str, Any]]) -> tuple[int, int]:
                     "date": date,
                     "events": [],
                 }
-            if not isinstance(document, dict) or not isinstance(document.get("events"), list):
-                raise ValueError(f"每日记忆文件格式无效：{path}")
-            if document.get("machine_id") != machine or document.get("agent") != agent:
-                raise ValueError(f"每日记忆文件身份不匹配：{path}")
-            existing = {event.get("event_id") for event in document["events"]}
             for event in incoming:
-                if event["event_id"] in existing:
-                    duplicates += 1
-                    continue
                 document["events"].append(event)
-                existing.add(event["event_id"])
                 added += 1
             document["events"].sort(key=lambda item: (item["created_at"], item["event_id"]))
             atomic_write_json(path, document)
@@ -285,19 +356,13 @@ def load_events(root: Path) -> tuple[list[dict[str, Any]], list[str]]:
     errors: list[str] = []
     for path in memory_files(root):
         try:
-            document = read_json(path)
-            values = document["events"]
-            if not isinstance(values, list):
-                raise ValueError("events 不是 array")
-            for raw in values:
-                event = normalize_event(raw)
-                item_errors = validate_event(event)
-                if item_errors:
-                    errors.append(f"{path}:{event.get('event_id', '?')}：{'；'.join(item_errors)}")
-                events.append(event)
+            document = read_daily(path)
+            events.extend(normalize_event(raw) for raw in document["events"])
         except (OSError, KeyError, TypeError, ValueError, json.JSONDecodeError) as exc:
             errors.append(f"{path}：{exc}")
-    events.sort(key=lambda item: (item.get("created_at", ""), item.get("event_id", "")))
+    counts = Counter(event["event_id"] for event in events)
+    errors.extend(f"重复 event_id：{event_id}" for event_id, count in counts.items() if count > 1)
+    events.sort(key=lambda item: (parse_time(item["created_at"]), item["event_id"]))
     return events, errors
 
 
@@ -314,8 +379,42 @@ def render_event(event: dict[str, Any]) -> str:
     return "\n".join(lines)
 
 
+def supersedes_cycles(events: list[dict[str, Any]]) -> set[str]:
+    graph = {event["event_id"]: event.get("supersedes", []) for event in events}
+    cyclic = set()
+    for start in graph:
+        pending, visited = list(graph[start]), set()
+        while pending:
+            key = pending.pop()
+            if key == start:
+                cyclic.add(start)
+                break
+            if key not in visited:
+                visited.add(key)
+                pending.extend(graph.get(key, []))
+    return cyclic
+
+
 def select_events(events: list[dict[str, Any]], args: argparse.Namespace) -> list[dict[str, Any]]:
-    selected = events
+    selected = list(events)
+    if getattr(args, "current", False):
+        if supersedes_cycles(events):
+            raise ValueError("supersedes 存在环，无法筛选当前记忆；请运行 audit 后人工核验")
+        superseded = {key for event in events for key in event.get("supersedes", [])}
+        selected = [
+            event for event in selected
+            if event["event_id"] not in superseded and event["status"] != "superseded"
+        ]
+    for option, key in (("machine", "machine_id"), ("topic", "topic_key")):
+        if getattr(args, option, None):
+            selected = [event for event in selected if event.get(key) == getattr(args, option)]
+    since, until = getattr(args, "since", None), getattr(args, "until", None)
+    if since and until and since >= until:
+        raise ValueError("--since 必须早于 --until（结束时间不包含在内）")
+    if since:
+        selected = [event for event in selected if parse_time(event["created_at"]) >= since]
+    if until:
+        selected = [event for event in selected if parse_time(event["created_at"]) < until]
     if getattr(args, "project", None):
         selected = [
             event
@@ -419,8 +518,6 @@ def command_status(root: Path, _args: argparse.Namespace) -> int:
 
 def command_validate(root: Path, _args: argparse.Namespace) -> int:
     events, errors = load_events(root)
-    counts = Counter(event.get("event_id") for event in events)
-    errors.extend(f"重复 event_id：{event_id}" for event_id, count in counts.items() if count > 1)
     if errors:
         print("\n".join(errors), file=sys.stderr)
         print(f"校验失败：{len(events)} 条事件，{len(errors)} 个错误", file=sys.stderr)
@@ -429,11 +526,115 @@ def command_validate(root: Path, _args: argparse.Namespace) -> int:
     return 0
 
 
+def command_get(root: Path, args: argparse.Namespace) -> int:
+    events, errors = load_events(root)
+    if errors:
+        raise ValueError("记忆库校验失败，请先运行 validate")
+    for event in events:
+        if event["event_id"] == args.event_id:
+            result = {"source": event_sources(root)[event["event_id"]], "event": event}
+            print(json.dumps(result, ensure_ascii=False, indent=2))
+            return 0
+    print("没有找到该 event_id。", file=sys.stderr)
+    return 1
+
+
+def event_sources(root: Path) -> dict[str, str]:
+    sources = {}
+    for path in memory_files(root):
+        try:
+            for event in read_daily(path)["events"]:
+                sources[event["event_id"]] = path.relative_to(root).as_posix()
+        except (ValueError, OSError):
+            continue
+    return sources
+
+
+def command_audit(root: Path, args: argparse.Namespace) -> int:
+    events, errors = load_events(root)
+    issues = [{"kind": "invalid", "detail": error} for error in errors]
+    known = {event["event_id"] for event in events}
+    superseded = {key for event in events for key in event.get("supersedes", [])}
+    sources = event_sources(root)
+    cyclic = supersedes_cycles(events)
+    replacements: dict[str, list[str]] = {}
+    for event in events:
+        for key in event.get("supersedes", []):
+            if event["event_id"] not in superseded:
+                replacements.setdefault(key, []).append(event["event_id"])
+    ambiguous = {key for values in replacements.values() if len(values) > 1 for key in values}
+    cutoff = utc_now() - dt.timedelta(days=args.stale_days)
+    selected = select_events(events, args)
+    for event in selected:
+        kinds = []
+        content = event["content"]
+        if (
+            not content.get("verified_by") and not content.get("where")
+            and not any(p.get("commit") for p in event["projects"])
+        ):
+            kinds.append("missing_source")
+        if any(key not in known for key in event.get("supersedes", [])):
+            kinds.append("dangling_supersedes")
+        if event["event_id"] in ambiguous:
+            kinds.append("parallel_supersedes_candidate")
+        if event["event_id"] in cyclic:
+            kinds.append("supersedes_cycle")
+        if Path(sources[event["event_id"]]).stem != event["created_at"][:10]:
+            kinds.append("legacy_date_mismatch")
+        if event["created_at"][-6:] != "+00:00" and not event["created_at"].endswith("Z"):
+            kinds.append("legacy_non_utc")
+        if (
+            event["event_id"] not in superseded
+            and event["status"] in {"active", "needs_verification"}
+            and event["event_type"] in {"progress", "risk", "hypothesis"}
+            and parse_time(event["created_at"]) < cutoff
+        ):
+            kinds.append("stale_candidate")
+        for kind in kinds:
+            issues.append({
+                "kind": kind, "event_id": event["event_id"],
+                "source": sources[event["event_id"]],
+            })
+    result = {
+        "checked_events": len(selected), "issues": issues,
+        "counts": dict(Counter(item["kind"] for item in issues)),
+    }
+    if args.json:
+        print(json.dumps(result, ensure_ascii=False, indent=2))
+    else:
+        print(f"检查 {result['checked_events']} 条事件；仅列候选问题，不自动删除或判定失效。")
+        for item in issues:
+            print(f"{item['kind']}: {item.get('event_id', item.get('detail', ''))}")
+        print(f"汇总：{result['counts']}")
+    return 1 if issues else 0
+
+
+def positive_int(value: str) -> int:
+    number = int(value)
+    if number <= 0:
+        raise argparse.ArgumentTypeError("必须大于 0")
+    return number
+
+
+def filter_time(value: str) -> dt.datetime:
+    try:
+        if re.fullmatch(r"\d{4}-\d{2}-\d{2}", value):
+            return parse_time(value + "T00:00:00Z")
+        return parse_time(value)
+    except ValueError as exc:
+        raise argparse.ArgumentTypeError("使用 YYYY-MM-DD（UTC）或带时区的 ISO-8601 时间") from exc
+
+
 def add_filters(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--project")
     parser.add_argument("--task")
     parser.add_argument("--agent")
-    parser.add_argument("--limit", type=int, default=20)
+    parser.add_argument("--machine")
+    parser.add_argument("--topic", help="精确 topic_key")
+    parser.add_argument("--since", type=filter_time, help="包含起点，日期按 UTC")
+    parser.add_argument("--until", type=filter_time, help="不包含终点，日期按 UTC")
+    parser.add_argument("--current", action="store_true", help="排除显式被取代事件，不自动判断同 topic 的正误")
+    parser.add_argument("--limit", type=positive_int, default=20)
     parser.add_argument("--json", action="store_true")
 
 
@@ -476,6 +677,15 @@ def parser() -> argparse.ArgumentParser:
 
     validate = subparsers.add_parser("validate", help="校验全部 daily JSON")
     validate.set_defaults(func=command_validate)
+
+    get = subparsers.add_parser("get", help="按 ID 读取完整事件及来源文件")
+    get.add_argument("event_id")
+    get.set_defaults(func=command_get)
+
+    audit = subparsers.add_parser("audit", help="只读检查来源、过期候选及 supersedes 引用")
+    add_filters(audit)
+    audit.add_argument("--stale-days", type=positive_int, default=60)
+    audit.set_defaults(func=command_audit, limit=None)
     return result
 
 

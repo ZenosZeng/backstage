@@ -20,6 +20,8 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Iterator
 
+import memory as memory_store
+
 
 ROOT = Path(__file__).resolve().parents[1]
 SHARED_DIRS = ("config", "long-term", "skills", "shared_files")
@@ -210,10 +212,16 @@ def validate_local_memory(root: Path) -> None:
 
 
 def validate_daily_files(root: Path) -> None:
+    seen: set[str] = set()
     for path in root.glob("*/*/*.json"):
-        document = read_json(path)
-        if not isinstance(document.get("events"), list):
-            raise SyncError(f"远端 daily JSON 缺少 events array：{path}")
+        try:
+            document = memory_store.read_daily(path)
+        except (ValueError, OSError) as exc:
+            raise SyncError(str(exc)) from exc
+        for event in document["events"]:
+            if event["event_id"] in seen:
+                raise SyncError(f"raw memory 包含重复 event_id：{path}")
+            seen.add(event["event_id"])
 
 
 @contextmanager
@@ -231,30 +239,51 @@ def shared_lock(root: Path) -> Iterator[None]:
 def push_memory(root: Path, config: dict[str, Any], *, dry_run: bool) -> None:
     machine_id = str(config["machine_id"])
     source = root / ".share" / "memory" / machine_id
-    source.mkdir(parents=True, exist_ok=True)
     sync = config["sync"]
-    if not any(source.rglob("*.json")):
+    if not any(source.glob("*/*.json")):
         print(f"当前机器还没有 raw memory：{machine_id}")
         return
     target = remote_path(sync["remote"], "memory", machine_id)
-    mirror(source, target, clear_proxy=bool(sync.get("clear_proxy")), dry_run=dry_run)
+    if dry_run:
+        mirror(source, target, clear_proxy=bool(sync.get("clear_proxy")), dry_run=True)
+        return
+    # Serialize push/pull on this host; append can continue while the snapshot uploads.
+    with memory_store.operation_lock(root, "raw-sync"):
+        with tempfile.TemporaryDirectory(prefix="agent-memory-push-") as temporary:
+            snapshot = Path(temporary) / machine_id
+            with memory_store.operation_lock(root, "memory-write"):
+                for path in source.glob("*/*.json"):
+                    document = memory_store.read_daily(path)
+                    atomic_write_json(snapshot / path.relative_to(source), document)
+            validate_daily_files(Path(temporary))
+            mirror(snapshot, target, clear_proxy=bool(sync.get("clear_proxy")), dry_run=False)
     print(f"已上传当前机器 memory：{machine_id}")
 
 
 def push_all_memory(root: Path, config: dict[str, Any], *, dry_run: bool) -> None:
     source = root / ".share" / "memory"
-    source.mkdir(parents=True, exist_ok=True)
     sync = config["sync"]
-    mirror(
-        source,
-        remote_path(sync["remote"], "memory"),
-        clear_proxy=bool(sync.get("clear_proxy")),
-        dry_run=dry_run,
-    )
+    target = remote_path(sync["remote"], "memory")
+    if dry_run:
+        mirror(source, target, clear_proxy=bool(sync.get("clear_proxy")), dry_run=True)
+        return
+    with memory_store.operation_lock(root, "raw-sync"):
+        with tempfile.TemporaryDirectory(prefix="agent-memory-init-") as temporary:
+            snapshot = Path(temporary)
+            with memory_store.operation_lock(root, "memory-write"):
+                for path in source.glob("*/*/*.json"):
+                    atomic_write_json(snapshot / path.relative_to(source), memory_store.read_daily(path))
+            validate_daily_files(snapshot)
+            mirror(snapshot, target, clear_proxy=bool(sync.get("clear_proxy")), dry_run=False)
     print("已上传初始化 memory 基线")
 
 
-def pull_other_memory(root: Path, config: dict[str, Any], *, dry_run: bool) -> None:
+def pull_other_memory(root: Path, config: dict[str, Any], *, dry_run: bool, include_owned: bool = False) -> None:
+    with memory_store.operation_lock(root, "raw-sync"):
+        _pull_other_memory(root, config, dry_run=dry_run, include_owned=include_owned)
+
+
+def _pull_other_memory(root: Path, config: dict[str, Any], *, dry_run: bool, include_owned: bool) -> None:
     sync = config["sync"]
     remote = remote_path(sync["remote"], "memory")
     clear_proxy = bool(sync.get("clear_proxy"))
@@ -269,14 +298,50 @@ def pull_other_memory(root: Path, config: dict[str, Any], *, dry_run: bool) -> N
         staging = Path(temporary) / "memory"
         staging.mkdir()
         mirror(remote, staging, clear_proxy=clear_proxy, dry_run=False)
-        validate_daily_files(staging)
         destination = root / ".share" / "memory"
-        destination.mkdir(parents=True, exist_ok=True)
-        for machine in staging.iterdir():
-            if not machine.is_dir() or machine.name == config["machine_id"]:
-                continue
-            shutil.copytree(machine, destination / machine.name, dirs_exist_ok=True)
-    print(f"已拉取其他机器 memory，本机目录 {config['machine_id']} 未被覆盖")
+        # Ignore our own (possibly stale) remote prefix, including its validation.
+        if not include_owned:
+            shutil.rmtree(staging / str(config["machine_id"]), ignore_errors=True)
+        validate_daily_files(staging)
+        with memory_store.operation_lock(root, "memory-write"):
+            local_events, errors = memory_store.load_events(root)
+            if errors:
+                raise SyncError("本地记忆校验失败，请先运行 memory.py validate")
+            local = {event["event_id"]: event for event in local_events}
+            incoming: dict[str, dict[str, Any]] = {}
+            documents = []
+            for path in sorted(staging.glob("*/*/*.json")):
+                document = memory_store.read_daily(path)
+                documents.append((destination / path.relative_to(staging), document))
+                for raw in document["events"]:
+                    event = memory_store.normalize_event(raw)
+                    incoming[event["event_id"]] = event
+            missing = sorted(
+                key for key, event in local.items()
+                if (include_owned or event["machine_id"] != config["machine_id"])
+                and key not in incoming
+            )
+            changed = sorted(
+                key for key in local.keys() & incoming.keys() if local[key] != incoming[key]
+            )
+            if missing or changed:
+                report = root / ".local" / ".sync" / "raw-conflict.json"
+                atomic_write_json(report, {
+                    "created_at": datetime.now(timezone.utc).isoformat(),
+                    "missing_ids": missing, "changed_ids": changed,
+                })
+                raise SyncError(
+                    f"远端 raw memory 回退或改写（缺失 {len(missing)}，冲突 {len(changed)}），"
+                    f"未安装；请核验 {report}。脱敏改写也需人工确认，不自动合并。"
+                )
+            for target, document in documents:
+                if not target.exists() or memory_store.read_daily(target) != document:
+                    atomic_write_json(target, document)
+            (root / ".local" / ".sync" / "raw-conflict.json").unlink(missing_ok=True)
+    if include_owned:
+        print(f"已恢复全部 memory，包含本机目录 {config['machine_id']}")
+    else:
+        print(f"已拉取其他机器 memory，本机目录 {config['machine_id']} 未被覆盖")
 
 
 def copy_shared_snapshot(source: Path, destination: Path) -> None:
@@ -749,6 +814,15 @@ def configure_agent_links(root: Path, config: dict[str, Any], *, dry_run: bool, 
         for skill_path in skills_root.rglob("SKILL.md")
         if skill_path.parent != skills_root and skill_path.parent.is_dir()
     )
+    # Old layouts leave a copy in a category named after its nested skill.
+    # Retain remote files for old clients; only link the canonical nested entry.
+    skills = [
+        skill for skill in skills
+        if not any(skill in child.parents and skill.name == child.name for child in skills)
+    ]
+    names = [skill.name for skill in skills]
+    if len(set(names)) != len(names):
+        raise SyncError("多个不同分类中有同名 Skill，请明确唯一来源后再建立链接")
     if not skills:
         raise SyncError(f"共享 Skill 目录为空：{skills_root}")
     links: list[tuple[Path, Path]] = []
@@ -869,7 +943,7 @@ def command_init(root: Path, args: argparse.Namespace) -> int:
         shared_writer=args.shared_writer,
         clear_proxy=clear_proxy,
     )
-    pull_other_memory(root, config, dry_run=False)
+    pull_other_memory(root, config, dry_run=False, include_owned=args.reuse_machine)
     atomic_write_json(root / "config.json", config)
     configure_agent_links(root, config, dry_run=False)
     validate_local_memory(root)
