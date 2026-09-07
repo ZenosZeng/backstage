@@ -25,11 +25,13 @@ from tools.watchdog.b1k_layout import (
 
 REPO_ROOT = workspace_root() / "BEHAVIOR-1K"
 DEFAULT_LOGS = (
+    REPO_ROOT / "scripts" / "eval" / "fleet" / "eval.log",
     REPO_ROOT / "scripts" / "eval" / "0srv16sim" / "eval.log",
     REPO_ROOT / "scripts" / "eval" / "2srv14sim" / "eval.log",
     REPO_ROOT / "scripts" / "eval" / "8srv8sim" / "eval.log",
 )
 DEFAULT_PROCESS_MARKERS = (
+    "scripts/eval/fleet/eval.py",
     "scripts/eval/0srv16sim/eval.py",
     "scripts/eval/2srv14sim/eval.py",
     "scripts/eval/8srv8sim/eval.py",
@@ -79,7 +81,7 @@ def eval_process_running() -> bool:
 
 class B1kEvalMonitor:
     name = "b1k-eval"
-    alert_interval = 600  # B1K 任务长，10 分钟检查一次
+    alert_interval = 60  # 每分钟检查；相同飞书通知仍由 notifier 去重。
     status_interval = 3600
 
     def __init__(
@@ -90,24 +92,37 @@ class B1kEvalMonitor:
         *,
         repo_root: Path | None = None,
         config_path: Path | None = None,
-        warning_seconds: float = 7200,
-        critical_seconds: float = 10800,
+        warning_seconds: float | None = None,
+        critical_seconds: float | None = None,
     ) -> None:
-        if not 0 < warning_seconds <= critical_seconds:
-            raise ValueError("stall thresholds must satisfy 0 < warning <= critical")
         self.repo_root = repo_root or REPO_ROOT
         self.config_path = config_path
         self.warning_seconds = warning_seconds
         self.critical_seconds = critical_seconds
         self.default_logs = tuple(
             self.repo_root / "scripts" / "eval" / name / "eval.log"
-            for name in ("0srv16sim", "2srv14sim", "8srv8sim")
+            for name in ("fleet", "0srv16sim", "2srv14sim", "8srv8sim")
         )
         configured_log = os.environ.get("B1K_EVAL_LOG")
         self.log_override = log_path or (
             Path(configured_log).expanduser() if configured_log else None
         )
         self.log_path = self._select_log()
+        is_fleet = self.log_path.parent.name == "fleet" and (
+            self.log_override is not None or self.log_path.exists()
+        )
+        self.warning_seconds = (
+            warning_seconds
+            if warning_seconds is not None
+            else (900 if is_fleet else 7200)
+        )
+        self.critical_seconds = (
+            critical_seconds
+            if critical_seconds is not None
+            else (3600 if is_fleet else 10800)
+        )
+        if not 0 < self.warning_seconds <= self.critical_seconds:
+            raise ValueError("stall thresholds must satisfy 0 < warning <= critical")
         self.process_checker = process_checker
         self.clock = clock
         self.last_completed: int | None = None

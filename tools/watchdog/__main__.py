@@ -36,8 +36,12 @@ def factory(kind: str):
                 config_path=resolve_path(config["eval_config"], config_path.parent)
                 if config.get("eval_config")
                 else None,
-                warning_seconds=float(config.get("stall_warning_seconds", 7200)),
-                critical_seconds=float(config.get("stall_critical_seconds", 10800)),
+                warning_seconds=float(config["stall_warning_seconds"])
+                if "stall_warning_seconds" in config
+                else None,
+                critical_seconds=float(config["stall_critical_seconds"])
+                if "stall_critical_seconds" in config
+                else None,
             )
         else:
             from tools.watchdog import train

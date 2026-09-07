@@ -63,6 +63,16 @@ class B1kMonitorTests(unittest.TestCase):
             monitor_b1k.DEFAULT_PROCESS_MARKERS,
         )
 
+    def test_fleet_log_and_process_are_monitored(self):
+        self.assertIn("scripts/eval/fleet/eval.py", monitor_b1k.DEFAULT_PROCESS_MARKERS)
+        self.assertTrue(
+            any("fleet/eval.log" in str(path) for path in monitor_b1k.DEFAULT_LOGS)
+        )
+        monitor = monitor_b1k.B1kEvalMonitor(
+            repo_root=self.root, process_checker=lambda: True
+        )
+        self.assertIn(self.root / "scripts/eval/fleet/eval.log", monitor.default_logs)
+
     def test_stall_warning_and_critical(self):
         monitor = self.monitor()
         self.write_log(self.HEARTBEAT)
@@ -75,6 +85,20 @@ class B1kMonitorTests(unittest.TestCase):
         self.assertIn(
             "eval-stalled-critical", [alert.key for alert in monitor.check_alerts()]
         )
+
+    def test_fleet_stall_defaults_and_minute_checks(self):
+        self.log_path = self.root / "fleet" / "eval.log"
+        self.log_path.parent.mkdir()
+        monitor = monitor_b1k.B1kEvalMonitor(
+            self.log_path, clock=self.clock, process_checker=lambda: True
+        )
+        self.assertEqual(monitor.alert_interval, 60)
+        self.write_log(self.HEARTBEAT)
+        monitor.check_alerts()
+        self.clock.value = 901
+        self.assertIn("eval-stalled-warning", [a.key for a in monitor.check_alerts()])
+        self.clock.value = 3601
+        self.assertIn("eval-stalled-critical", [a.key for a in monitor.check_alerts()])
 
     def test_failure_increase_and_process_death(self):
         monitor = self.monitor()

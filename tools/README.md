@@ -41,7 +41,7 @@ PID 身份通过启动时间、命令、工作目录核验；不会用宽泛 `pk
 | watchdog-train | `repo_root`、`log_root`、`kubectl_args`、`experiments` |
 | claude-feishu | `credentials_file`、`workdir`、`claude_cli`、`timeout_seconds`、`permission_profile` |
 
-B1K 默认查找 `scripts/eval/{0srv16sim,2srv14sim,8srv8sim}/eval.log` 中最新日志。
+B1K 默认查找 `scripts/eval/{fleet,0srv16sim,2srv14sim,8srv8sim}/eval.log` 中最新日志。
 自定义请求建议显式指定 `log` 和 `eval_config`；兼容 `B1K_EVAL_LOG` / `B1K_EVAL_CONFIG`，
 但 JSON 显式字段优先。汇总只读当前 TOML 选中的 summary，保留 EMA/raw、namespace、horizon/steps 区别。
 
@@ -54,6 +54,8 @@ Pi 默认查找 workspace 的 `Pi_b1k`（存在时）或 `Pi`，读取其 `kjob_
 共用监控设置：`poll_seconds=60`；整点发送例行状态；默认 0-7 点和 13 点静默，告警不静默。
 B1K 停滞提醒/严重阈值为 7200/10800 秒；Pi 为 900/3600 秒，可通过
 `stall_warning_seconds` / `stall_critical_seconds` 调整。
+Fleet 日志默认使用 900/3600 秒，告警每分钟检查。正式多机评测前应显式设置
+`log` 为 fleet 的 `eval.log`、`eval_config` 为本次 TOML，重启 watchdog 后检查 `--status`。
 七类卡片为任务开始、完成、故障、停滞、整点状态、监控启动、监控停止。
 同内容成功发送后 600 秒去重；HTTP 200 仍检查业务 `code == 0`。
 
