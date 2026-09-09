@@ -20,6 +20,7 @@ CARD_TEMPLATES = {
     "start": ("blue", "开始"),
     "finished": ("green", "完成"),
     "failed": ("red", "故障"),
+    "warning": ("orange", "警告"),
     "stalled": ("orange", "停滞"),
     "heartbeat": ("turquoise", "整点提醒"),
     "watchdog_started": ("violet", "监控已启动"),

@@ -110,11 +110,12 @@ class B1kMonitorTests(unittest.TestCase):
         )
         alerts = monitor.check_alerts()
         self.assertIn("eval-failures-increased", [alert.key for alert in alerts])
-        self.assertIn("failed", [alert.card_type for alert in alerts])
+        warning = next(alert for alert in alerts if alert.key == "eval-failures-increased")
+        self.assertEqual(warning.card_type, "warning")
+        self.assertEqual(warning.severity, "warning")
         self.running = False
-        self.assertIn(
-            "eval-process-died", [alert.key for alert in monitor.check_alerts()]
-        )
+        died = next(alert for alert in monitor.check_alerts() if alert.key == "eval-process-died")
+        self.assertEqual(died.card_type, "failed")
 
     def test_process_completion_uses_finished_card(self):
         monitor = self.monitor()
@@ -142,6 +143,55 @@ class B1kMonitorTests(unittest.TestCase):
         self.assertEqual(heartbeat["total_rollouts"], 200)
         self.assertEqual(heartbeat["failed_rollouts"], 0)
         self.assertEqual(heartbeat["eta"], "01:00:00")
+
+    def test_log_config_overrides_stale_watchdog_and_results(self):
+        checkpoint = self.root / "ckpts/exp/step70000/ema"
+        configs = []
+        for name in ("raw", "q95"):
+            path = self.root / f"{name}.toml"
+            path.write_text(
+                f"# request_id = \"stale-comment\"\n[request]\nrequest_id = '{name}'\n"
+                f'[defaults]\noutput_root = "{self.root / name}"\n'
+                f'[[jobs]]\ncheckpoint = "{checkpoint}"\ntask = "radio"\n'
+            )
+            configs.append(path)
+        old_summary = self.root / "raw/exp/step70000/ema/radio/summary.json"
+        old_summary.parent.mkdir(parents=True)
+        old_summary.write_text(json.dumps({"completed_rollouts": 120, "successes": 19, "mean_q_score": 0.225}))
+        monitor = monitor_b1k.B1kEvalMonitor(self.log_path, config_path=configs[0])
+        self.write_log(f"Config: {configs[1]}", "x" * (300 * 1024),
+                       "Progress: completed=21/880, failures=21, ETA=estimating")
+        content = monitor.card_content("存在失败")
+        self.assertIn("**q95**", content)
+        self.assertNotIn("19/120", content)
+        self.assertIn("结果：暂无", content)
+        self.assertIn("已结束尝试：21/880", content)
+        self.assertIn("有效完成：0", content)
+        self.assertIn("运行失败：21", content)
+        self.assertIn("有效完成：0", monitor.status())
+        self.assertIn("有效完成：0", monitor._started_content())
+        # The monitor follows a replaced log without restarting its process.
+        self.log_path.write_text(f"Config: {configs[0]}\n{self.HEARTBEAT}\n")
+        self.assertEqual(monitor._toml_request_id(), "raw")
+
+    def test_missing_log_config_never_falls_back_to_old_request(self):
+        old = self.root / "old.toml"
+        old.write_text('[request]\nrequest_id = "old"\n')
+        monitor = monitor_b1k.B1kEvalMonitor(self.log_path, config_path=old)
+        missing = self.root / "missing.toml"
+        self.write_log(f"Config: {missing}", self.HEARTBEAT)
+        self.assertEqual(monitor._eval_toml_path(), missing)
+        self.assertEqual(monitor._toml_request_id(), "")
+        self.assertEqual(monitor._per_checkpoint_results(), [])
+
+    def test_relative_log_config_resolves_against_repo(self):
+        monitor = monitor_b1k.B1kEvalMonitor(self.log_path, repo_root=self.root)
+        self.write_log("Config: some directory/run.toml", self.HEARTBEAT)
+        self.assertEqual(monitor._eval_toml_path(), self.root / "some directory/run.toml")
+
+    def test_successful_and_failed_attempts_are_separate(self):
+        self.write_log("Progress: completed=25/880, failures=21, ETA=estimating")
+        self.assertIn("有效完成：4", self.monitor().card_content("运行中"))
 
     def test_card_content_has_b1k_metrics(self):
         old_repo = monitor_b1k.REPO_ROOT
@@ -315,6 +365,7 @@ class NotifierCardTests(unittest.TestCase):
             "start",
             "finished",
             "failed",
+            "warning",
             "stalled",
             "heartbeat",
             "watchdog_started",
@@ -325,6 +376,8 @@ class NotifierCardTests(unittest.TestCase):
             payload = notifier.build_card(card_type, "标题", "内容", label="B1K评测")
             self.assertEqual(payload["msg_type"], "interactive")
             self.assertIn("[B1K评测]", payload["card"]["header"]["title"]["content"])
+        self.assertEqual(notifier.build_card("warning", "标题", "内容")["card"]["header"]["template"], "orange")
+        self.assertEqual(notifier.build_card("failed", "标题", "内容")["card"]["header"]["template"], "red")
 
     def test_unknown_card_type_is_rejected(self):
         with self.assertRaises(ValueError):

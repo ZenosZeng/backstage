@@ -68,10 +68,15 @@ def factory(config: dict, config_path: Path, directory: Path) -> Application:
             "CLAUDE_FEISHU_STATE": str(directory / "seen.json"),
             "CLAUDE_FEISHU_SESSIONS": str(directory / "sessions.json"),
             "CLAUDE_FEISHU_TIMEOUT": str(int(config.get("timeout_seconds", 600))),
+            "CLAUDE_FEISHU_PROGRESS_INTERVAL": str(
+                int(config.get("progress_interval_seconds", 600))
+            ),
         }
     )
     if int(os.environ["CLAUDE_FEISHU_TIMEOUT"]) <= 0:
         raise ValueError("timeout_seconds must be positive")
+    if int(os.environ["CLAUDE_FEISHU_PROGRESS_INTERVAL"]) <= 0:
+        raise ValueError("progress_interval_seconds must be positive")
     from tools.claude_feishu import bridge
 
     def shutdown():

@@ -6,6 +6,7 @@ from __future__ import annotations
 import importlib.util
 import json
 import os
+import subprocess
 import tempfile
 import time
 import unittest
@@ -71,7 +72,9 @@ class SessionContextTests(unittest.TestCase):
             bridge._execute_and_reply(
                 _event(message_id="s1", event_id="se1"), "hello", "chat-123"
             )
-        run.assert_called_once_with("hello", "chat-123")
+        run.assert_called_once()
+        self.assertEqual(run.call_args.args, ("hello", "chat-123"))
+        self.assertIsNotNone(run.call_args.kwargs.get("on_progress"))
 
     def test_get_or_create_session_persists_mapping(self):
         bridge = self.bridge
@@ -154,6 +157,76 @@ class ReplayGuardTests(unittest.TestCase):
             bridge.handle_message(app)
         reply.assert_not_called()
         thread.assert_not_called()
+
+
+class RunClaudeProgressTests(unittest.TestCase):
+    """长任务执行：按 PROGRESS_INTERVAL 分片等待并回调 on_progress，总时长受 EXEC_TIMEOUT 约束。"""
+
+    @classmethod
+    def setUpClass(cls):
+        cls.tempdir = tempfile.TemporaryDirectory()
+        os.environ["CLAUDE_FEISHU_SESSIONS"] = str(Path(cls.tempdir.name) / "sessions.json")
+        os.environ["CLAUDE_FEISHU_STATE"] = str(Path(cls.tempdir.name) / "seen.json")
+        os.environ["FEISHU_ALLOW_OPEN_IDS"] = "allowed"
+        os.environ["CLAUDE_FEISHU_TIMEOUT"] = "3600"
+        os.environ["CLAUDE_FEISHU_PROGRESS_INTERVAL"] = "600"
+        spec = importlib.util.spec_from_file_location(
+            "bridge_progress_under_test", ROOT / "bridge.py"
+        )
+        cls.bridge = importlib.util.module_from_spec(spec)
+        assert spec.loader is not None
+        spec.loader.exec_module(cls.bridge)
+
+    def test_heartbeat_until_completion(self):
+        bridge = self.bridge
+
+        class FakeProc:
+            returncode = 0
+
+            def __init__(self):
+                self.chunks = []
+
+            def communicate(self, timeout=None):
+                self.chunks.append(timeout)
+                if len(self.chunks) < 3:
+                    raise subprocess.TimeoutExpired(["claude"], timeout)
+                return "done", ""
+
+            def poll(self):
+                return None
+
+        fake = FakeProc()
+        progress = []
+        with (
+            mock.patch.object(bridge, "_get_or_create_session", return_value=("sid", False)),
+            mock.patch.object(bridge, "_persist_sessions"),
+            mock.patch.object(bridge.subprocess, "Popen", return_value=fake),
+        ):
+            out = bridge._run_claude("p", "chat", on_progress=progress.append)
+        self.assertEqual(out, "done")
+        self.assertEqual(len(progress), 2)
+        self.assertEqual(fake.chunks, [600.0, 600.0, 600.0])
+
+    def test_total_deadline_kills_process_group(self):
+        bridge = self.bridge
+
+        class NeverFinishes:
+            def communicate(self, timeout=None):
+                raise subprocess.TimeoutExpired(["claude"], timeout)
+
+            def poll(self):
+                return None
+
+        with (
+            mock.patch.object(bridge, "_get_or_create_session", return_value=("sid", False)),
+            mock.patch.object(bridge, "_persist_sessions"),
+            mock.patch.object(bridge.subprocess, "Popen", return_value=NeverFinishes()),
+            mock.patch.object(bridge, "_kill_process_group") as kill,
+            mock.patch.object(bridge.time, "monotonic", side_effect=[1000.0, 4600.0]),
+        ):
+            with self.assertRaises(subprocess.TimeoutExpired):
+                bridge._run_claude("p", "chat")
+        kill.assert_called_once()
 
 
 if __name__ == "__main__":

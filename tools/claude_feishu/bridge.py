@@ -30,6 +30,7 @@ import shutil
 import subprocess
 import threading
 import urllib.request
+from typing import Callable
 
 SCRIPT_DIR = pathlib.Path(__file__).resolve().parent
 HOME_DIR = pathlib.Path.home()
@@ -58,6 +59,9 @@ ALLOW_OPEN_IDS = {
 OPEN_MODE = os.environ.get("FEISHU_OPEN_MODE", "") == "1"
 MAX_REPLY = 3800  # 单条消息字符上限（长回复分块发送）
 EXEC_TIMEOUT = int(os.environ.get("CLAUDE_FEISHU_TIMEOUT", "600"))  # 单条指令上限
+PROGRESS_INTERVAL = int(
+    os.environ.get("CLAUDE_FEISHU_PROGRESS_INTERVAL", "600")
+)  # 执行中的进行中提醒间隔
 # 去重持久化（审计 H7：重启后不丢）
 SEEN_FILE = os.environ.get(
     "CLAUDE_FEISHU_STATE", str(HOME_DIR / ".local/state/claude-feishu-seen.json")
@@ -400,12 +404,17 @@ def _kill_process_group(proc: subprocess.Popen) -> None:
         pass
 
 
-def _run_claude(prompt: str, chat_id: str = "") -> str:
+def _run_claude(
+    prompt: str, chat_id: str = "", on_progress: Callable[[int], None] | None = None
+) -> str:
     """Execute the prompt headless in a fresh process group; returns final text.
 
     会话上下文：同一 chat 复用 claude 原生会话（新建用 --session-id 固定 id，
     之后 -r 恢复），对话历史（含工具调用）由 claude 自己持久化并自动压缩。
     会话被外部清理（~/.claude/projects 被删）时自动重建一次。
+
+    长任务：按 PROGRESS_INTERVAL 分片等待，每次超时（进程仍活着）调用
+    on_progress(已等待秒数)；总等待不超过 EXEC_TIMEOUT。
     """
     global _active_process
     while not _stopping.is_set():
@@ -427,10 +436,23 @@ def _run_claude(prompt: str, chat_id: str = "") -> str:
             )
             _active_process = proc
         try:
-            out, err = proc.communicate(timeout=EXEC_TIMEOUT)
-        except subprocess.TimeoutExpired:
-            _kill_process_group(proc)
-            raise
+            started = time.monotonic()
+            deadline = started + EXEC_TIMEOUT
+            out = err = None
+            while True:
+                chunk = min(PROGRESS_INTERVAL, deadline - time.monotonic())
+                if chunk <= 0:
+                    _kill_process_group(proc)
+                    raise subprocess.TimeoutExpired(cmd, EXEC_TIMEOUT)
+                try:
+                    out, err = proc.communicate(timeout=chunk)
+                    break
+                except subprocess.TimeoutExpired:
+                    if proc.poll() is None and on_progress is not None:
+                        try:
+                            on_progress(int(time.monotonic() - started))
+                        except Exception:  # noqa: BLE001 - 提醒失败不中断执行
+                            logging.warning("progress notify failed", exc_info=True)
         finally:
             with _process_lock:
                 if _active_process is proc:
@@ -558,7 +580,7 @@ def handle_message(data: P2ImMessageReceiveV1) -> None:
             "🤖 Claude Code 遥控\n"
             "- 直接发指令（如：检查训练状态）→ claude -p 执行并回复\n"
             "- 群聊需 @ 机器人；私聊直接发\n"
-            "- 单条最长 5 分钟，超时自动中断\n"
+            "- 单条最长 60 分钟；执行中每 10 分钟发一条进行中提醒\n"
             "- 同一会话保留上下文（跨消息记忆；FEISHU_SESSION_CONTEXT=0 关闭）",
         )
         return
@@ -585,7 +607,13 @@ def _execute_and_reply(
         start = time.time()
         digest = hashlib.sha256(text.encode()).hexdigest()[:8]
         logging.info("exec start hash=%s", digest)
-        answer = _run_claude(text, chat_id)
+        answer = _run_claude(
+            text,
+            chat_id,
+            on_progress=lambda elapsed_s: _post_reply(
+                data, f"🤔 还在思考中（约 {max(1, elapsed_s // 60)} 分钟）…"
+            ),
+        )
         elapsed = time.time() - start
         logging.info("exec done in %.0fs", elapsed)
         if not _send_reply(data, f"✅ 执行完成（{elapsed:.0f}s）\n\n{answer}"):

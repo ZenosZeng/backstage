@@ -227,6 +227,17 @@ class B1kEvalMonitor:
         return {}
 
     def _eval_toml_path(self) -> Path:
+        # The scheduler's header identifies the run, unlike a persistent watchdog
+        # config which may still point at the previous experiment.
+        try:
+            with self._refresh_log().open(encoding="utf-8", errors="ignore") as stream:
+                header = stream.read(64 * 1024)
+            paths = re.findall(r"^Config: (.+)$", header, re.MULTILINE)
+            if paths:
+                path = Path(paths[-1].strip()).expanduser()
+                return path if path.is_absolute() else self.repo_root / path
+        except OSError:
+            pass
         if self.config_path is not None:
             return self.config_path
         configured = os.environ.get("B1K_EVAL_CONFIG")
@@ -433,8 +444,8 @@ class B1kEvalMonitor:
             alerts.append(
                 Alert(
                     "eval-failures-increased",
-                    "critical",
-                    "failed",
+                    "warning" if running else "critical",
+                    "warning" if running else "failed",
                     "评测失败数增加",
                     f"{self.card_content('存在失败')}\n- 原因：failed_rollouts {self.last_failures} → {failures}",
                 )
@@ -493,11 +504,20 @@ class B1kEvalMonitor:
         """从当前 eval.toml 的 [request] 表读 request_id（B1K 日志无 request 行）。"""
         toml_path = self._eval_toml_path()
         try:
-            text = toml_path.read_text(encoding="utf-8", errors="ignore")
-        except OSError:
+            payload = tomllib.loads(toml_path.read_text(encoding="utf-8"))
+            request = payload.get("request", {})
+            return str(request.get("request_id") or "") if isinstance(request, dict) else ""
+        except (OSError, tomllib.TOMLDecodeError):
             return ""
-        match = re.search(r"request_id\s*=\s*\"([^\"]+)\"", text)
-        return match.group(1) if match else ""
+
+    @staticmethod
+    def _progress_text(heartbeat: dict) -> str:
+        attempted = int(heartbeat.get("completed_rollouts", 0))
+        failures = int(heartbeat.get("failed_rollouts", 0))
+        return (
+            f"已结束尝试：{attempted}/{heartbeat.get('total_rollouts', '?')} rollouts；"
+            f"有效完成：{max(0, attempted - failures)}；运行失败：{failures}"
+        )
 
     def _started_content(self) -> str:
         """评测启动卡片（与训练侧同格式：第一行加粗评测名 - 状态 + bullets）。
@@ -509,10 +529,7 @@ class B1kEvalMonitor:
         if completed is None:
             lines.append("- 状态待发布（启动早期）")
         else:
-            lines.append(
-                f"- 进度：{completed}/{heartbeat.get('total_rollouts', '?')} rollouts，"
-                f"failures {heartbeat.get('failed_rollouts', 0)}"
-            )
+            lines.append(f"- {self._progress_text(heartbeat)}")
         lines.append(f"- 时间：{time.strftime('%Y-%m-%d %H:%M:%S')}")
         return "\n".join(lines)
 
@@ -527,9 +544,8 @@ class B1kEvalMonitor:
         return "\n".join(
             (
                 f"**{self._toml_request_id() or 'B1K Eval'}** - {state}",
-                f"- 进度：{heartbeat.get('completed_rollouts', 0)}/{heartbeat.get('total_rollouts', '?')} rollouts",
+                f"- {self._progress_text(heartbeat)}",
                 results_text,
-                f"- 失败：{heartbeat.get('failed_rollouts', 0)}",
                 f"- ETA：{heartbeat.get('eta', '-')}",
                 f"- 时间：{time.strftime('%Y-%m-%d %H:%M:%S')}",
             )
@@ -543,7 +559,7 @@ class B1kEvalMonitor:
         mean_q = result.get("mean_q")
         q_text = f"{mean_q:.3f}" if mean_q is not None else "-"
         return (
-            f"进度 {heartbeat.get('completed_rollouts', 0)}/{heartbeat.get('total_rollouts', '?')} rollouts；"
+            f"{self._progress_text(heartbeat)}；"
             f"结果 SR {successes}/{completed}，Q {q_text}；"
-            f"失败 {heartbeat.get('failed_rollouts', 0)}，ETA {heartbeat.get('eta', '-')}"
+            f"ETA {heartbeat.get('eta', '-')}"
         )
