@@ -69,10 +69,10 @@ class SyncTest(unittest.TestCase):
 
     def write_shared(self, base: Path, marker: str) -> None:
         files = {
-            ".share/config/prompts/AGENTS.md": f"agents {marker}\n",
-            ".share/config/prompts/CLAUDE.md": f"claude {marker}\n",
-            ".share/long-term/_workspace.md": f"workspace {marker}\n",
-            ".share/skills/memory/SKILL.md": f"skill {marker}\n",
+            ".share/agent/prompts/AGENTS.md": f"agents {marker}\n",
+            ".share/agent/prompts/CLAUDE.md": f"claude {marker}\n",
+            ".share/knowledge/_workspace.md": f"workspace {marker}\n",
+            ".share/agent/skills/memory/SKILL.md": f"skill {marker}\n",
         }
         for relative, content in files.items():
             path = base / relative
@@ -81,8 +81,8 @@ class SyncTest(unittest.TestCase):
 
     def write_eval_docs(self, base: Path, request: str, report: str) -> None:
         files = {
-            ".share/shared_files/b1k-docs/eval_request.yaml": request,
-            ".share/shared_files/b1k-docs/eval_report.md": report,
+            ".share/docs/b1k/eval_request.yaml": request,
+            ".share/docs/b1k/eval_report.md": report,
         }
         for relative, content in files.items():
             path = base / relative
@@ -299,7 +299,7 @@ class SyncTest(unittest.TestCase):
                 allow_non_writer=False,
             )
         self.assertEqual(
-            (self.root / ".share" / "long-term" / "_workspace.md").read_text(encoding="utf-8"),
+            (self.root / ".share" / "knowledge" / "_workspace.md").read_text(encoding="utf-8"),
             "workspace remote\n",
         )
         self.assertTrue(SYNC.shared_base(self.root).is_dir())
@@ -320,12 +320,12 @@ class SyncTest(unittest.TestCase):
                 allow_non_writer=False,
             )
         self.assertEqual(
-            (self.root / ".share" / "long-term" / "_workspace.md").read_text(encoding="utf-8"),
+            (self.root / ".share" / "knowledge" / "_workspace.md").read_text(encoding="utf-8"),
             "workspace local\n",
         )
         self.assertTrue((SYNC.shared_conflict(self.root) / "report.json").is_file())
         self.assertEqual(
-            (SYNC.shared_conflict(self.root) / "remote" / ".share" / "long-term" / "_workspace.md").read_text(
+            (SYNC.shared_conflict(self.root) / "remote" / ".share" / "knowledge" / "_workspace.md").read_text(
                 encoding="utf-8"
             ),
             "workspace remote\n",
@@ -338,9 +338,9 @@ class SyncTest(unittest.TestCase):
         remote = Path(self.temporary.name) / "remote-shared"
         # 远端只有部分文件（缺 _workspace.md 与 CLAUDE.md → 回退特征）
         remote_files = {
-            ".share/config/prompts/AGENTS.md": "agents remote\n",
-            ".share/long-term/_workspace.md": "workspace base\n",
-            ".share/skills/memory/SKILL.md": "skill base\n",
+            ".share/agent/prompts/AGENTS.md": "agents remote\n",
+            ".share/knowledge/_workspace.md": "workspace base\n",
+            ".share/agent/skills/memory/SKILL.md": "skill base\n",
         }
         for relative, content in remote_files.items():
             path = remote / relative
@@ -360,10 +360,10 @@ class SyncTest(unittest.TestCase):
                 allow_non_writer=False,
             )
         # 本地未被覆盖（CLAUDE.md 还在），冲突快照已保存
-        self.assertTrue((self.root / ".share" / "config" / "prompts" / "CLAUDE.md").is_file())
+        self.assertTrue((self.root / ".share" / "agent" / "prompts" / "CLAUDE.md").is_file())
         self.assertTrue((SYNC.shared_conflict(self.root) / "report.json").is_file())
         self.assertTrue(
-            (SYNC.shared_conflict(self.root) / "remote" / ".share" / "config" / "prompts" / "CLAUDE.md").exists()
+            (SYNC.shared_conflict(self.root) / "remote" / ".share" / "agent" / "prompts" / "CLAUDE.md").exists()
             is False
         )
 
@@ -373,7 +373,7 @@ class SyncTest(unittest.TestCase):
         SYNC.update_shared_base(self.root, self.root)
         remote = Path(self.temporary.name) / "remote-shared"
         self.write_shared(remote, "remote")
-        extra = remote / ".share" / "shared_files" / "new_doc.md"
+        extra = remote / ".share" / "docs" / "new_doc.md"
         extra.parent.mkdir(parents=True, exist_ok=True)
         extra.write_text("new doc\n", encoding="utf-8")
 
@@ -386,7 +386,7 @@ class SyncTest(unittest.TestCase):
                 allow_non_writer=False,
             )
         self.assertEqual(
-            (self.root / ".share" / "shared_files" / "new_doc.md").read_text(encoding="utf-8"),
+            (self.root / ".share" / "docs" / "new_doc.md").read_text(encoding="utf-8"),
             "new doc\n",
         )
 
@@ -404,7 +404,7 @@ class SyncTest(unittest.TestCase):
                 allow_non_writer=False,
             )
         self.assertEqual(
-            (self.root / ".share" / "skills" / "memory" / "SKILL.md").read_text(encoding="utf-8"),
+            (self.root / ".share" / "agent" / "skills" / "memory" / "SKILL.md").read_text(encoding="utf-8"),
             "skill remote\n",
         )
 
@@ -413,7 +413,7 @@ class SyncTest(unittest.TestCase):
         SYNC.update_shared_base(self.root, self.root)
         remote = Path(self.temporary.name) / "remote-shared"
         self.write_shared(remote, "base")
-        (self.root / ".share" / "skills" / "memory" / "SKILL.md").write_text(
+        (self.root / ".share" / "agent" / "skills" / "memory" / "SKILL.md").write_text(
             "skill local\n", encoding="utf-8"
         )
         with (
@@ -436,7 +436,7 @@ class SyncTest(unittest.TestCase):
         SYNC.update_shared_base(self.root, self.root)
         remote = Path(self.temporary.name) / "remote-shared"
         self.write_shared(remote, "base")
-        (self.root / ".share" / "skills" / "memory" / "SKILL.md").write_text(
+        (self.root / ".share" / "agent" / "skills" / "memory" / "SKILL.md").write_text(
             "skill local\n", encoding="utf-8"
         )
         with (
@@ -454,7 +454,7 @@ class SyncTest(unittest.TestCase):
     def test_both_sides_changed_requires_merge(self) -> None:
         self.write_shared(self.root, "base")
         SYNC.update_shared_base(self.root, self.root)
-        (self.root / ".share" / "long-term" / "_workspace.md").write_text(
+        (self.root / ".share" / "knowledge" / "_workspace.md").write_text(
             "workspace local\n", encoding="utf-8"
         )
         remote = Path(self.temporary.name) / "remote-shared"
@@ -473,14 +473,14 @@ class SyncTest(unittest.TestCase):
         report = json.loads(
             (SYNC.shared_conflict(self.root) / "report.json").read_text(encoding="utf-8")
         )
-        self.assertIn(".share/long-term/_workspace.md", report["local_changes"])
-        self.assertIn(".share/long-term/_workspace.md", report["remote_changes"])
+        self.assertIn(".share/knowledge/_workspace.md", report["local_changes"])
+        self.assertIn(".share/knowledge/_workspace.md", report["remote_changes"])
 
     def test_publish_shared_file_merges_remote_request_and_local_report(self) -> None:
         self.write_shared(self.root, "base")
         self.write_eval_docs(self.root, "request base\n", "report base\n")
         SYNC.update_shared_base(self.root, self.root)
-        (self.root / ".share/shared_files/b1k-docs/eval_report.md").write_text(
+        (self.root / ".share/docs/b1k/eval_report.md").write_text(
             "report local\n", encoding="utf-8"
         )
         remote = Path(self.temporary.name) / "remote-file-publish"
@@ -494,18 +494,18 @@ class SyncTest(unittest.TestCase):
             SYNC.publish_shared_file(
                 self.root,
                 self.config,
-                Path("shared_files/b1k-docs/eval_report.md"),
+                Path("docs/b1k/eval_report.md"),
                 dry_run=False,
                 allow_non_writer=False,
             )
 
         copy.assert_called_once()
         self.assertEqual(
-            (self.root / ".share/shared_files/b1k-docs/eval_request.yaml").read_text(),
+            (self.root / ".share/docs/b1k/eval_request.yaml").read_text(),
             "request remote\n",
         )
         self.assertEqual(
-            (self.root / ".share/shared_files/b1k-docs/eval_report.md").read_text(),
+            (self.root / ".share/docs/b1k/eval_report.md").read_text(),
             "report local\n",
         )
 
@@ -513,7 +513,7 @@ class SyncTest(unittest.TestCase):
         self.write_shared(self.root, "base")
         self.write_eval_docs(self.root, "request base\n", "report base\n")
         SYNC.update_shared_base(self.root, self.root)
-        (self.root / ".share/shared_files/b1k-docs/eval_report.md").write_text(
+        (self.root / ".share/docs/b1k/eval_report.md").write_text(
             "report local\n", encoding="utf-8"
         )
         remote = Path(self.temporary.name) / "remote-file-conflict"
@@ -527,7 +527,7 @@ class SyncTest(unittest.TestCase):
             SYNC.publish_shared_file(
                 self.root,
                 self.config,
-                Path("shared_files/b1k-docs/eval_report.md"),
+                Path("docs/b1k/eval_report.md"),
                 dry_run=False,
                 allow_non_writer=False,
             )
@@ -536,13 +536,13 @@ class SyncTest(unittest.TestCase):
         """resolve 前远端新增未并入本地（用户只合了部分冲突）→ 拒绝整包上传。"""
         self.write_shared(self.root, "base")
         SYNC.update_shared_base(self.root, self.root)
-        (self.root / ".share" / "long-term" / "_workspace.md").write_text(
+        (self.root / ".share" / "knowledge" / "_workspace.md").write_text(
             "workspace local\n", encoding="utf-8"
         )
         remote = Path(self.temporary.name) / "remote-shared"
         self.write_shared(remote, "remote")
         # 远端新增一个文件（base 没有）——分叉前就存在，report 快照含它
-        extra = remote / ".share" / "shared_files" / "new_doc.md"
+        extra = remote / ".share" / "docs" / "new_doc.md"
         extra.parent.mkdir(parents=True, exist_ok=True)
         extra.write_text("remote new\n", encoding="utf-8")
         with (
@@ -568,7 +568,7 @@ class SyncTest(unittest.TestCase):
     def test_resolve_refuses_when_remote_changed_again(self) -> None:
         self.write_shared(self.root, "base")
         SYNC.update_shared_base(self.root, self.root)
-        (self.root / ".share" / "long-term" / "_workspace.md").write_text(
+        (self.root / ".share" / "knowledge" / "_workspace.md").write_text(
             "workspace local\n", encoding="utf-8"
         )
         remote = Path(self.temporary.name) / "remote-shared"
@@ -641,7 +641,7 @@ class SyncTest(unittest.TestCase):
         self.assertTrue(config["sync"]["initialized"])
         self.assertNotIn("projects", config)
         self.assertEqual(
-            (self.root / ".share" / "long-term" / "_workspace.md").read_text(encoding="utf-8"),
+            (self.root / ".share" / "knowledge" / "_workspace.md").read_text(encoding="utf-8"),
             "workspace remote\n",
         )
 
@@ -657,12 +657,12 @@ class SyncTest(unittest.TestCase):
             ("train", ("upload-pi-checkpoint",)),
         ):
             for name in names:
-                skill = self.root / ".share" / "skills" / category / name
+                skill = self.root / ".share" / "agent" / "skills" / category / name
                 skill.mkdir(parents=True, exist_ok=True)
                 (skill / "SKILL.md").write_text(f"# {name}\n", encoding="utf-8")
         # A legacy category copy must not steal the nested skill's symlink.
-        (self.root / ".share/skills/memory/SKILL.md").write_text("# legacy\n")
-        prompts = self.root / ".share" / "config" / "prompts"
+        (self.root / ".share/agent/skills/memory/SKILL.md").write_text("# legacy\n")
+        prompts = self.root / ".share" / "agent" / "prompts"
         prompts.mkdir(parents=True, exist_ok=True)
         (prompts / "AGENTS.md").write_text("agents\n", encoding="utf-8")
         (prompts / "CLAUDE.md").write_text("claude\n", encoding="utf-8")
@@ -685,7 +685,7 @@ class SyncTest(unittest.TestCase):
                 self.assertTrue(link.is_symlink(), f"{link} missing for {name}")
                 self.assertEqual(
                     link.resolve(),
-                    (self.root / ".share" / "skills" / relative).resolve(),
+                    (self.root / ".share" / "agent" / "skills" / relative).resolve(),
                 )
         self.assertEqual((workspace / "AGENTS.md").resolve(), (prompts / "AGENTS.md").resolve())
         self.assertEqual((workspace / "CLAUDE.md").resolve(), (prompts / "CLAUDE.md").resolve())
@@ -719,10 +719,10 @@ class SyncTest(unittest.TestCase):
         home = Path(self.temporary.name) / "home"
         workspace = Path(self.temporary.name) / "workspace"
         self.config["workspace_root"] = str(workspace)
-        skill = self.root / ".share" / "skills" / "eval" / "check-goai-eval-status"
+        skill = self.root / ".share" / "agent" / "skills" / "eval" / "check-goai-eval-status"
         skill.mkdir(parents=True, exist_ok=True)
         (skill / "SKILL.md").write_text("# check-goai-eval-status\n", encoding="utf-8")
-        prompts = self.root / ".share" / "config" / "prompts"
+        prompts = self.root / ".share" / "agent" / "prompts"
         prompts.mkdir(parents=True, exist_ok=True)
         (prompts / "AGENTS.md").write_text("agents\n", encoding="utf-8")
         (prompts / "CLAUDE.md").write_text("claude\n", encoding="utf-8")
@@ -770,3 +770,53 @@ class SyncTest(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class ManagedLinkMigrationTests(unittest.TestCase):
+    """审计 P1：共享区目录改名后，本系统建的旧链接要能自动改指。"""
+
+    def setUp(self) -> None:
+        self.temporary = tempfile.TemporaryDirectory()
+        self.root = Path(self.temporary.name) / ".agents"
+        (self.root / ".share").mkdir(parents=True)
+        self.managed_root = self.root / ".share"
+
+    def tearDown(self) -> None:
+        self.temporary.cleanup()
+
+    def test_migrates_stale_managed_link(self) -> None:
+        """旧链接指向共享区里已改名的旧路径 → 直接改指到新位置。"""
+        target = self.managed_root / "agent" / "skills" / "memory" / "memory"
+        target.mkdir(parents=True)
+        link = Path(self.temporary.name) / ".codex" / "skills" / "memory"
+        link.parent.mkdir(parents=True)
+        link.symlink_to(self.managed_root / "skills" / "memory" / "memory")  # 旧布局，已失效
+
+        SYNC.ensure_link(link, target, dry_run=False, managed_root=self.managed_root)
+
+        self.assertTrue(link.is_symlink())
+        self.assertEqual(link.resolve(), target.resolve())
+        self.assertTrue(link.exists())  # 不再是断链
+
+    def test_keeps_user_owned_link(self) -> None:
+        """指向共享区之外的链接是用户配置，必须拒绝改动。"""
+        target = self.managed_root / "agent" / "skills" / "x"
+        target.mkdir(parents=True)
+        mine = Path(self.temporary.name) / "my-own-skill"
+        mine.mkdir()
+        link = Path(self.temporary.name) / ".codex" / "skills" / "x"
+        link.parent.mkdir(parents=True)
+        link.symlink_to(mine)
+
+        with self.assertRaisesRegex(SYNC.SyncError, "不会覆盖已有 Agent 配置"):
+            SYNC.ensure_link(link, target, dry_run=False, managed_root=self.managed_root)
+        self.assertEqual(link.resolve(), mine.resolve())  # 原样保留
+
+    def test_keeps_real_directory(self) -> None:
+        target = self.managed_root / "agent" / "skills" / "y"
+        target.mkdir(parents=True)
+        existing = Path(self.temporary.name) / ".codex" / "skills" / "y"
+        existing.mkdir(parents=True)
+
+        with self.assertRaisesRegex(SYNC.SyncError, "不会覆盖已有 Agent 配置"):
+            SYNC.ensure_link(existing, target, dry_run=False, managed_root=self.managed_root)

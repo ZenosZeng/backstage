@@ -12,11 +12,37 @@
 | 层级 | 内容 | 真实来源 |
 |---|---|---|
 | 公共核心 | `config.template.json`、`scripts/`、`tools/`、`tests/`、Pixi 环境、CI 和文档 | Git |
-| 共享工作区状态（本地收纳于 `.agents/.share/`） | `config/`、`skills/`、`long-term/`、`shared_files/`、`memory/` | S3 |
+| 共享工作区状态（本地收纳于 `.agents/.share/`） | `agent/prompts/`、`agent/skills/`、`knowledge/`、`docs/`、`setup/` | S3 |
 | 原始记忆事件 | `memory/<machine>/<agent>/<UTC-date>.json` | S3 |
 | 本机运行状态（本地收纳于 `.agents/.local/`，`config.json` 保留根目录） | `config.json`、`.locks/`、`.sync/`、`config/`、`tools/` 服务状态 | 仅本机 |
 
+`.share/` 各目录的分工（2026-09-11 重排，旧名见下表）：
+
+| 目录 | 内容 |
+|---|---|
+| `agent/prompts/` | `AGENTS.md` / `CLAUDE.md`——各 Agent 的入口 Prompt |
+| `agent/skills/` | Skill 库（`common/ eval/ inference/ memory/ train/`） |
+| `knowledge/` | 策展长期知识：`_workspace.md`、`projects/`、`timeline/` |
+| `docs/` | 项目工作文档：`b1k/`、`goai/` |
+| `setup/` | 机器部署手册 `onboarding/` 与工作目录速查 |
+
 原始事件按机器和 Agent 分区，每台机器只上传自己的前缀。共享状态采用完整目录同步，并使用本地基线检测本地与 S3 是否发生分叉。
+
+**2026-09-11 结构重排**（`SHARED_DIRS` 随之更新，远端目录名同步变更）：
+
+| 旧 | 新 |
+|---|---|
+| `config/prompts/` | `agent/prompts/` |
+| `skills/` | `agent/skills/` |
+| `long-term/` | `knowledge/` |
+| `shared_files/` | `docs/` |
+| `shared_files/b1k-docs/` | `docs/b1k/` |
+| `shared_files/goai-docs-sim/` | `docs/goai/` |
+| `shared_files/goai-docs-real/data_audit_20260826/` | `docs/goai/data-audit-20260826/` |
+| `shared_files/onboarding/` | `setup/onboarding/` |
+
+旧远端前缀不再同步；其他机器 pull 后本地残留的旧目录可手动清理。`memory/` 中的历史事件
+保持原样（记录的是写入当时的路径），迁移本身不追改历史。
 
 记忆核心只依赖 Python 标准库和 MinIO Client（`mc`），不需要数据库、MCP Server 或本地搜索服务。
 工具环境另由 Pixi 锁定 Python 和飞书 SDK，不借用业务仓库环境。
@@ -35,17 +61,18 @@
 └── tests/
 ```
 
-`config.template.json` 随 Git 发布。执行 S3 初始化后，本地会出现 `.share/`（`config/`、`skills/`、`long-term/`、`memory/`、`shared_files/`）和 `.local/`（`.locks/`、`.sync/`）；这些工作区专属内容均被 Git 忽略，顶层只保留 `config.json`。
+`config.template.json` 随 Git 发布。执行 S3 初始化后，本地会出现 `.share/`（`agent/prompts/`、`agent/skills/`、`knowledge/`、`docs/`、`setup/`、`memory/`）和 `.local/`（`.locks/`、`.sync/`）；这些工作区专属内容均被 Git 忽略，顶层只保留 `config.json`。
 
 ## S3 结构
 
 ```text
 <remote>/
-├── config/
-│   └── prompts/
-├── skills/
-├── long-term/
-├── shared_files/
+├── agent/
+│   ├── prompts/
+│   └── skills/
+├── knowledge/
+├── docs/
+├── setup/
 └── memory/
     └── <machine>/<agent>/<UTC-date>.json
 ```
@@ -70,7 +97,7 @@ git clone <公共仓库地址> ~/code/.agents
 再从 S3 初始化：
 
 以下命令用于加入已有共享工作区。远端须已包含自己的 Skill（至少一个
-`skills/<name>/SKILL.md`）和 `config/prompts/{AGENTS,CLAUDE}.md`。
+`agent/skills/<分类>/<name>/SKILL.md`）和 `agent/prompts/{AGENTS,CLAUDE}.md`。
 公共仓库不附带私人 Skill 或项目知识，空 S3 前缀不能直接作为已初始化工作区使用。
 
 ```bash
@@ -115,8 +142,8 @@ git clone <公共仓库地址> ~/code/.agents
 
 1. 从根目录 `config.template.json` 创建本机 `config.json`，填写唯一 `machine_id`、
    `machine_role`、`workspace_root` 和 `sync.remote`，将 `shared_writer` 设为 `true`。
-2. 在 `.share/skills/` 放入自己的 Skill，在 `.share/config/prompts/` 准备
-   `AGENTS.md` 和 `CLAUDE.md`；项目长期知识放入 `.share/long-term/`。
+2. 在 `.share/agent/skills/` 放入自己的 Skill，在 `.share/agent/prompts/` 准备
+   `AGENTS.md` 和 `CLAUDE.md`；项目长期知识放入 `.share/knowledge/`。
 3. 校验后向专用空前缀初始化上传。此操作会发布共享文件，须先确认内容不含凭据。
 
 ```bash
@@ -155,7 +182,7 @@ python3 scripts/sync.py resolve-shared
 
 # 发布单个有明确所有权的共享文件，并拉取其他远端更新
 python3 scripts/sync.py publish-shared-file \
-  shared_files/project-docs/report.md
+  docs/project-docs/report.md
 ```
 
 `--machine`、`--project`、`--task`、`--agent`、`--topic` 是精确筛选，关键词搜索为
@@ -189,7 +216,8 @@ Agent 日常只读相关摘要和少量事件，按 ID 取证；整理长期记�
 写清 machine_id、证据日期和事件 ID。周报/月报使用时间筛选，不把运行状态当成永久事实。
 
 工具代码升级走 Git，S3 只同步共享内容，不会自动把新 CLI 分发到其他机器；新 Skill
-在旧 CLI 上应降级到原有查询。已有命令、S3 key 和目录兼容，无需批量迁移。
+在旧 CLI 上应降级到原有查询。**目录结构变更（如 2026-09-11 的 `.share/` 重排）需要
+各机器先升级 CLI（`git pull`）再同步**，否则旧 CLI 仍按 `SHARED_DIRS` 找旧目录。
 
 已知限制：本地锁不能协调两台机器复用同一个 machine_id；shared 基线比较不是远端
 CAS 事务，检查后到上传期间仍有竞态，应遵守指定 writer/文件所有权，避免同时发布。
@@ -221,7 +249,7 @@ python3 scripts/sync.py resolve-shared
 
 `publish-shared-file` 用于 request/report 这类分属不同机器维护的文件：只上传
 指定文件，同时把远端其他文件合并到本地；若远端也修改了同一个文件则拒绝
-覆盖。它不适合发布 Skill、long-term 或一组相互依赖的共享文件。
+覆盖。它不适合发布 Skill、长期知识或一组相互依赖的共享文件。
 
 ## 测试
 

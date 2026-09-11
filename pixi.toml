@@ -1,6 +1,6 @@
 [workspace]
 name = "agent-workspace"
-version = "0.3.0"
+version = "0.4.0"
 description = "Memory, monitoring and remote Agent tools"
 channels = ["conda-forge"]
 platforms = ["linux-64"]

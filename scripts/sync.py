@@ -24,7 +24,7 @@ import memory as memory_store
 
 
 ROOT = Path(__file__).resolve().parents[1]
-SHARED_DIRS = ("config", "long-term", "skills", "shared_files")
+SHARED_DIRS = ("agent/prompts", "agent/skills", "knowledge", "docs", "setup")
 SAFE_NAME = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.-]*$")
 PROXY_KEYS = {
     "all_proxy",
@@ -457,6 +457,12 @@ def download_shared(
         target = destination / ".share" / name
         if not dry_run:
             target.mkdir(parents=True, exist_ok=True)
+        # 远端还没有这个前缀（首次发布新目录结构）时视为空，而不是让 mc 报错中断。
+        # 目录改名/迁移后第一台机器 push 之前，其他机器 pull 都会走到这里。
+        if not remote_has_objects(
+            remote_path(remote, name), clear_proxy=clear_proxy, dry_run=dry_run
+        ):
+            continue
         mirror(
             remote_path(remote, name),
             target,
@@ -509,7 +515,9 @@ def normalize_shared_file(root: Path, value: Path) -> tuple[Path, str]:
     if not candidate.is_file():
         raise SyncError(f"待发布 shared 文件不存在：{candidate}")
     relative = candidate.relative_to(root.resolve()).as_posix()
-    if relative.split("/", 2)[1] not in SHARED_DIRS:
+    # SHARED_DIRS 允许嵌套（如 agent/prompts），按前缀匹配而不是取单段
+    inner = relative[len(".share/"):] if relative.startswith(".share/") else relative
+    if not any(inner == name or inner.startswith(name + "/") for name in SHARED_DIRS):
         raise SyncError(f"不支持的 shared 文件路径：{relative}")
     return candidate, relative
 
@@ -793,10 +801,45 @@ def resolve_shared(
     print("已上传合并后的 shared 内容并刷新基线")
 
 
-def ensure_link(path: Path, target: Path, *, dry_run: bool) -> None:
-    if path.is_symlink() and path.resolve() == target.resolve():
-        return
-    if path.exists() or path.is_symlink():
+def _link_is_managed(path: Path, managed_root: Path) -> bool:
+    """该符号链接是否指向共享区内部（含已改名/已失效的旧路径）。
+
+    只有本系统自己建的链接才算"可迁移"；指向别处的链接是用户自有配置。
+    失效链接用 resolve()（非严格）也能拿到目标路径，因此改名后仍可识别。
+    """
+    try:
+        current = Path(os.readlink(path))
+    except OSError:
+        return False
+    if not current.is_absolute():
+        current = path.parent / current
+    try:
+        current.resolve().relative_to(managed_root.resolve())
+    except (ValueError, OSError):
+        return False
+    return True
+
+
+def ensure_link(
+    path: Path, target: Path, *, dry_run: bool, managed_root: Path | None = None
+) -> None:
+    """建立/修正指向共享区的链接。
+
+    指向共享区的旧链接属于本系统管理：共享区目录改名后（如 2026-09-11 的
+    skills→agent/skills）直接改指到新位置；其余已存在的链接、文件或目录一律
+    不碰——那是用户自己的配置。
+    """
+    if path.is_symlink():
+        if path.resolve() == target.resolve():
+            return
+        if managed_root is not None and _link_is_managed(path, managed_root):
+            if dry_run:
+                print(f"DRY-RUN: relink {path} -> {target}")
+                return
+            path.unlink()
+        else:
+            raise SyncError(f"不会覆盖已有 Agent 配置：{path}")
+    elif path.exists():
         raise SyncError(f"不会覆盖已有 Agent 配置：{path}")
     if dry_run:
         print(f"DRY-RUN: ln -s {target} {path}")
@@ -806,7 +849,7 @@ def ensure_link(path: Path, target: Path, *, dry_run: bool) -> None:
 
 
 def configure_agent_links(root: Path, config: dict[str, Any], *, dry_run: bool, strict: bool = True) -> None:
-    skills_root = root / ".share" / "skills"
+    skills_root = root / ".share" / "agent" / "skills"
     # 2026-08-12 skills 按 common/eval/memory/train 分类后为多级布局：
     # 递归发现所有含 SKILL.md 的目录（父目录即 skill 名），跳过分类目录本身。
     skills = sorted(
@@ -830,11 +873,11 @@ def configure_agent_links(root: Path, config: dict[str, Any], *, dry_run: bool, 
         for agent_home in (".codex", ".claude", ".kimi-code"):
             links.append((Path.home() / agent_home / "skills" / skill.name, skill))
     workspace = Path(os.path.expanduser(str(config["workspace_root"])))
-    links.append((workspace / "AGENTS.md", root / ".share" / "config" / "prompts" / "AGENTS.md"))
-    links.append((workspace / "CLAUDE.md", root / ".share" / "config" / "prompts" / "CLAUDE.md"))
+    links.append((workspace / "AGENTS.md", root / ".share" / "agent" / "prompts" / "AGENTS.md"))
+    links.append((workspace / "CLAUDE.md", root / ".share" / "agent" / "prompts" / "CLAUDE.md"))
     for path, target in links:
         try:
-            ensure_link(path, target, dry_run=dry_run)
+            ensure_link(path, target, dry_run=dry_run, managed_root=root / ".share")
         except SyncError as error:
             # strict=False（sync/pull 路径）：单条链接冲突不阻断同步，
             # 机器上已有同名真实配置时保留现状并提示。
@@ -993,7 +1036,13 @@ def command_sync(root: Path, args: argparse.Namespace) -> int:
     config = load_config(root)
     validate_local_memory(root)
     push_memory(root, config, dry_run=args.dry_run)
-    pull_other_memory(root, config, dry_run=args.dry_run)
+    try:
+        pull_other_memory(root, config, dry_run=args.dry_run)
+    except SyncError as error:
+        # raw 冲突要人工确认、不做自动安装（保护不变），但它是**单个事件**的问题，
+        # 不该连带跳过共享同步与 skill 链接维护——2026-09-11 迁移时就因此静默留下
+        # 了 51 个失效链接。这里改为警告后继续，冲突细节仍在 raw-conflict.json。
+        print(f"警告：{error}\n继续同步 shared 与 agent 链接。", file=sys.stderr)
     reconcile_shared(
         root,
         config,
