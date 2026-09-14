@@ -565,6 +565,112 @@ class SyncTest(unittest.TestCase):
             SYNC.resolve_shared(self.root, self.config, dry_run=False, allow_non_writer=False)
         upload.assert_not_called()
 
+    def test_resolve_same_path_content_guard(self) -> None:
+        # Seven unchanged paths reproduce the incident: moving other files does
+        # not mean these local baseline contents incorporated remote updates.
+        paths = [f".share/docs/document-{i}.md" for i in range(7)]
+        for scenario in ("stale", "diverged", "local-only", "adopted", "same-addition", "different-addition"):
+            with self.subTest(scenario=scenario):
+                for directory in (self.root / ".share", self.root / ".local"):
+                    shutil.rmtree(directory, ignore_errors=True)
+                self.write_shared(self.root, "base")
+                for relative in paths:
+                    path = self.root / relative
+                    path.parent.mkdir(parents=True, exist_ok=True)
+                    path.write_text("base")
+                SYNC.update_shared_base(self.root, self.root)
+                base = SYNC.shared_manifest(self.root)
+                remote = Path(self.temporary.name) / f"remote-{scenario}"
+                SYNC.copy_shared_snapshot(self.root, remote)
+                if scenario.endswith("addition"):
+                    paths_to_change = [".share/docs/added.md"]
+                else:
+                    paths_to_change = paths
+                for relative in paths_to_change:
+                    (remote / relative).write_text("base" if scenario == "local-only" else "remote")
+                    if scenario != "stale":
+                        (self.root / relative).write_text(
+                            "remote" if scenario in ("adopted", "same-addition") else "local"
+                        )
+                conflict = SYNC.save_shared_conflict(
+                    self.root,
+                    remote_snapshot=remote,
+                    base_manifest=base,
+                    local_manifest=SYNC.shared_manifest(self.root),
+                    remote_manifest=SYNC.shared_manifest(remote),
+                )
+                before_local = SYNC.shared_manifest(self.root)
+                before_report = (conflict / "report.json").read_bytes()
+                before_remote = SYNC.shared_manifest(remote)
+                with (
+                    mock.patch.object(SYNC, "download_shared", side_effect=self.fake_download(remote)),
+                    mock.patch.object(SYNC, "upload_shared") as upload,
+                ):
+                    if scenario in ("stale", "diverged", "different-addition"):
+                        with self.assertRaises(SYNC.SyncError) as raised:
+                            SYNC.resolve_shared(self.root, self.config, dry_run=False, allow_non_writer=True)
+                        message = str(raised.exception)
+                        self.assertIn("本地仍为基线旧版" if scenario == "stale" else "双方内容分叉", message)
+                        for relative in paths_to_change:
+                            self.assertIn(relative, message)
+                        self.assertIn(str(conflict / "remote"), message)
+                        upload.assert_not_called()
+                        self.assertEqual(SYNC.shared_manifest(self.root), before_local)
+                        self.assertEqual(SYNC.shared_manifest(SYNC.shared_base(self.root)), base)
+                        self.assertEqual((conflict / "report.json").read_bytes(), before_report)
+                        self.assertEqual(SYNC.shared_manifest(remote), before_remote)
+                    else:
+                        SYNC.resolve_shared(self.root, self.config, dry_run=False, allow_non_writer=False)
+                        upload.assert_called_once_with(self.root, self.config, dry_run=False)
+                        self.assertEqual(SYNC.shared_manifest(SYNC.shared_base(self.root)), before_local)
+                        self.assertFalse(conflict.exists())
+
+    def test_resolve_remote_deletion_guard(self) -> None:
+        for scenario in ("retained", "adopted", "edited"):
+            with self.subTest(scenario=scenario):
+                for directory in (self.root / ".share", self.root / ".local"):
+                    shutil.rmtree(directory, ignore_errors=True)
+                self.write_shared(self.root, "base")
+                gone = self.root / ".share/knowledge/gone.md"
+                gone.write_text("base")
+                SYNC.update_shared_base(self.root, self.root)
+                base = SYNC.shared_manifest(self.root)
+                remote = Path(self.temporary.name) / f"deleted-{scenario}"
+                SYNC.copy_shared_snapshot(self.root, remote)
+                (remote / ".share/knowledge/gone.md").unlink()
+                with (
+                    mock.patch.object(SYNC, "download_shared", side_effect=self.fake_download(remote)),
+                    mock.patch.object(SYNC, "upload_shared") as upload,
+                ):
+                    with self.assertRaises(SYNC.SyncError):
+                        SYNC.reconcile_shared(
+                            self.root, self.config, mode="both",
+                            dry_run=False, allow_non_writer=False,
+                        )
+                    if scenario == "adopted":
+                        gone.unlink()
+                    elif scenario == "edited":
+                        gone.write_text("explicit local edit")
+                    conflict = SYNC.shared_conflict(self.root)
+                    before_local = SYNC.shared_manifest(self.root)
+                    before_report = (conflict / "report.json").read_bytes()
+                    before_remote = SYNC.shared_manifest(remote)
+                    if scenario == "retained":
+                        with self.assertRaisesRegex(SYNC.SyncError, "远端已删除、本地仍保留") as raised:
+                            SYNC.resolve_shared(self.root, self.config, dry_run=False, allow_non_writer=True)
+                        self.assertIn(".share/knowledge/gone.md", str(raised.exception))
+                        self.assertIn(str(conflict / "remote"), str(raised.exception))
+                        upload.assert_not_called()
+                        self.assertEqual(SYNC.shared_manifest(self.root), before_local)
+                        self.assertEqual(SYNC.shared_manifest(SYNC.shared_base(self.root)), base)
+                        self.assertEqual((conflict / "report.json").read_bytes(), before_report)
+                        self.assertEqual(SYNC.shared_manifest(remote), before_remote)
+                    else:
+                        SYNC.resolve_shared(self.root, self.config, dry_run=False, allow_non_writer=False)
+                        upload.assert_called_once_with(self.root, self.config, dry_run=False)
+                        self.assertEqual(SYNC.shared_manifest(SYNC.shared_base(self.root)), before_local)
+                        self.assertFalse(conflict.exists())
+
     def test_resolve_refuses_when_remote_changed_again(self) -> None:
         self.write_shared(self.root, "base")
         SYNC.update_shared_base(self.root, self.root)

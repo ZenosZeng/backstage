@@ -373,6 +373,28 @@ def changed_paths(base: dict[str, str], side: dict[str, str]) -> list[str]:
     )
 
 
+def content_rollbacks(
+    base: dict[str, str], local: dict[str, str], remote: dict[str, str],
+) -> tuple[list[str], list[str], list[str]]:
+    """Identify stale contents, ambiguous edits and unadopted remote deletions."""
+    stale: list[str] = []
+    diverged: list[str] = []
+    for path in sorted(set(local) & set(remote)):
+        if local[path] == remote[path] or remote[path] == base.get(path):
+            continue
+        if local[path] == base.get(path):
+            stale.append(path)
+        else:
+            # Includes different contents independently added at the same path.
+            # Hashes cannot prove that a third version is a completed merge.
+            diverged.append(path)
+    deleted = sorted(
+        path for path in (set(local) & set(base)) - set(remote)
+        if local[path] == base[path]
+    )
+    return stale, diverged, deleted
+
+
 def shared_base(root: Path) -> Path:
     return root / ".local" / ".sync" / "base"
 
@@ -792,6 +814,25 @@ def resolve_shared(
             raise SyncError(
                 "resolve 前请先合并远端新增文件到本地（当前缺失）："
                 f"{preview}；请从 {conflict / 'remote'} 补齐后再 resolve-shared"
+            )
+        stale, diverged, deleted = content_rollbacks(base_manifest, local_manifest, remote_manifest)
+        if stale or diverged or deleted:
+            details = []
+            for label, paths in (
+                ("本地仍为基线旧版", stale),
+                ("双方内容分叉", diverged),
+                ("远端已删除、本地仍保留", deleted),
+            ):
+                if paths:
+                    preview = ", ".join(paths[:10])
+                    if len(paths) > 10:
+                        preview += f" 等 {len(paths)} 个"
+                    details.append(f"{label}：{preview}")
+            raise SyncError(
+                "resolve 拒绝回退远端变更；" + "；".join(details)
+                + f"；请核对 {conflict / 'remote'} 中的远端版本。"
+                "请先备份本地修改，将这些路径对齐远端（含采纳删除）并 resolve-shared，"
+                "再编辑和发布本地修改"
             )
         upload_shared(root, config, dry_run=False)
         local_snapshot = Path(temporary) / "local"
