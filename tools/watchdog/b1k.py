@@ -55,6 +55,11 @@ class Alert:
     card_type: str
     title: str
     message: str
+    # 生命周期/边沿事件（进程启动、结束、异常退出）：只在状态**真的变化**时产生，
+    # 每次都是新事件，不应被 alert_interval 限流——否则「死亡 → 重启 → 很快再次
+    # 死亡」只会发出第一张故障卡，第二次静默丢掉（2026-09-14 审计 P2）。
+    # 持续型告警（如 stalled：只要还停滞就每轮都报）才需要限流。
+    lifecycle: bool = False
 
 
 def eval_process_running() -> bool:
@@ -81,7 +86,10 @@ def eval_process_running() -> bool:
 
 class B1kEvalMonitor:
     name = "b1k-eval"
-    alert_interval = 60  # 每分钟检查；相同飞书通知仍由 notifier 去重。
+    # 同一告警键的最小重发间隔（秒）。轮询仍是 poll_seconds，但同一条告警
+    # 在此时长内不会重复推卡片；2026-09-13 由 60 调为 600（用户反馈每分钟一条太吵）。
+    # 告警内容常带随时间变化的进度数字，notifier 的 payload 去重挡不住，需靠这里限流。
+    alert_interval = 600
     status_interval = 3600
 
     def __init__(
@@ -94,11 +102,16 @@ class B1kEvalMonitor:
         config_path: Path | None = None,
         warning_seconds: float | None = None,
         critical_seconds: float | None = None,
+        alert_interval_seconds: float | None = None,
     ) -> None:
         self.repo_root = repo_root or REPO_ROOT
         self.config_path = config_path
         self.warning_seconds = warning_seconds
         self.critical_seconds = critical_seconds
+        if alert_interval_seconds is not None:
+            if alert_interval_seconds <= 0:
+                raise ValueError("alert_interval_seconds must be positive")
+            self.alert_interval = float(alert_interval_seconds)
         self.default_logs = tuple(
             self.repo_root / "scripts" / "eval" / name / "eval.log"
             for name in ("fleet", "0srv16sim", "2srv14sim", "8srv8sim")
@@ -463,6 +476,7 @@ class B1kEvalMonitor:
                     "start",
                     "评测已启动",
                     self._started_content(),
+                    lifecycle=True,
                 )
             )
         elif previous_running is True and not running:
@@ -480,6 +494,7 @@ class B1kEvalMonitor:
                         "finished",
                         "评测已结束",
                         self.card_content(state),
+                        lifecycle=True,
                     )
                 )
             else:
@@ -490,6 +505,7 @@ class B1kEvalMonitor:
                         "failed",
                         "评测进程异常退出",
                         self.card_content(f"异常结束（status={final or 'unknown'}）"),
+                        lifecycle=True,
                     )
                 )
         self.last_completed = completed

@@ -42,6 +42,9 @@ def factory(kind: str):
                 critical_seconds=float(config["stall_critical_seconds"])
                 if "stall_critical_seconds" in config
                 else None,
+                alert_interval_seconds=float(config["alert_interval_seconds"])
+                if "alert_interval_seconds" in config
+                else None,
             )
         else:
             from tools.watchdog import train

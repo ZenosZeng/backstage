@@ -92,13 +92,32 @@ class B1kMonitorTests(unittest.TestCase):
         monitor = monitor_b1k.B1kEvalMonitor(
             self.log_path, clock=self.clock, process_checker=lambda: True
         )
-        self.assertEqual(monitor.alert_interval, 60)
+        self.assertEqual(monitor.alert_interval, 600)
         self.write_log(self.HEARTBEAT)
         monitor.check_alerts()
         self.clock.value = 901
         self.assertIn("eval-stalled-warning", [a.key for a in monitor.check_alerts()])
         self.clock.value = 3601
         self.assertIn("eval-stalled-critical", [a.key for a in monitor.check_alerts()])
+
+    def test_alert_interval_is_configurable(self):
+        """告警重发间隔可经配置覆盖，默认 600 秒（2026-09-13 由 60 调高以降低推送频率）。"""
+        default = monitor_b1k.B1kEvalMonitor(
+            self.root / "fleet" / "eval.log", process_checker=lambda: True
+        )
+        self.assertEqual(default.alert_interval, 600)
+        overridden = monitor_b1k.B1kEvalMonitor(
+            self.root / "fleet" / "eval.log",
+            process_checker=lambda: True,
+            alert_interval_seconds=1800,
+        )
+        self.assertEqual(overridden.alert_interval, 1800)
+        with self.assertRaises(ValueError):
+            monitor_b1k.B1kEvalMonitor(
+                self.root / "fleet" / "eval.log",
+                process_checker=lambda: True,
+                alert_interval_seconds=0,
+            )
 
     def test_failure_increase_and_process_death(self):
         monitor = self.monitor()

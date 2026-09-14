@@ -35,7 +35,12 @@ def run(
             try:
                 for alert in monitor.check_alerts():
                     now = time.monotonic()
-                    if (
+                    # 生命周期/边沿事件（进程启动、结束、异常退出）只在状态真的变化时
+                    # 产生，每次都算新事件，不能被 alert_interval 吃掉——否则「死亡 →
+                    # 重启 → 很快再次死亡」只会发出第一张故障卡。限流只作用于持续型
+                    # 告警（如 stalled：只要还停滞就每轮都报）。
+                    # getattr 兜底：其他 monitor（如 train）的 Alert 可能没有该字段。
+                    if getattr(alert, "lifecycle", False) or (
                         now - last_alert.get(alert.key, float("-inf"))
                         >= monitor.alert_interval
                     ):
