@@ -335,6 +335,10 @@ def _append_events(root: Path, events: list[dict[str, Any]]) -> tuple[int, int]:
         existing[event["event_id"]] = event
         grouped.setdefault(daily_path(root, event), []).append(event)
 
+    reference_errors = lifecycle_reference_errors(list(existing.values()))
+    if reference_errors:
+        raise ValueError("；".join(item["detail"] for item in reference_errors))
+
     added = 0
     for path, incoming in grouped.items():
         machine, agent, filename = path.parts[-3:]
@@ -465,13 +469,36 @@ def relevance_score(event: dict[str, Any], terms: list[str]) -> int:
     return sum(weight for text, weight in fields for term in terms if term in text.casefold())
 
 
+def lifecycle_reference_errors(events: list[dict[str, Any]]) -> list[dict[str, str]]:
+    """Validate lifecycle edges against the full set, including cross-machine parents."""
+    by_id = {event["event_id"]: event for event in events}
+    states = {key: event for key, event in by_id.items() if "task_state" in event["content"]}
+    issues = []
+    for event in events:
+        for parent_id in event.get("supersedes", []):
+            parent = by_id.get(parent_id)
+            if event["event_id"] in states:
+                invalid = parent_id not in states or parent.get("task_id") != event.get("task_id")
+            else:
+                invalid = parent_id in states
+            if invalid:
+                issues.append({"kind": "invalid_lifecycle_reference", "event_id": event["event_id"],
+                               "detail": f"任务状态引用无效：{event['event_id']} -> {parent_id}；生命周期仅能取代同任务状态事件，普通事件不能取代生命周期"})
+    for event_id in sorted(supersedes_cycles(list(states.values()))):
+        issues.append({"kind": "lifecycle_cycle", "event_id": event_id,
+                       "detail": f"任务状态引用存在环：{event_id}"})
+    return issues
+
+
 def task_states(events: list[dict[str, Any]]) -> dict[str, dict[str, Any]]:
     """Project explicit lifecycle heads; ordinary progress never reopens a task."""
     if supersedes_cycles(events):
         raise ValueError("supersedes 存在环，请先运行 audit")
+    errors = lifecycle_reference_errors(events)
+    if errors:
+        raise ValueError("；".join(item["detail"] for item in errors))
     replaced = {key for event in events for key in event.get("supersedes", [])}
     tasks: dict[str, dict[str, Any]] = {}
-    by_id = {event["event_id"]: event for event in events}
     for event in events:
         task = event.get("task_id")
         if not task:
@@ -480,10 +507,6 @@ def task_states(events: list[dict[str, Any]]) -> dict[str, dict[str, Any]]:
         item["projects"] = sorted(set(item["projects"]) | {p["name"] for p in event["projects"]})
         if "task_state" not in event["content"]:
             continue
-        for parent_id in event.get("supersedes", []):
-            parent = by_id.get(parent_id)
-            if parent is None or parent.get("task_id") != task or "task_state" not in parent["content"]:
-                raise ValueError(f"任务状态引用无效：{event['event_id']}；父记录必须是同任务状态事件")
         if event["event_id"] not in replaced and event["status"] != "superseded":
             item["heads"].append(event)
     for item in tasks.values():
@@ -703,6 +726,7 @@ def command_status(root: Path, _args: argparse.Namespace) -> int:
 
 def command_validate(root: Path, _args: argparse.Namespace) -> int:
     events, errors = load_events(root)
+    errors.extend(item["detail"] for item in lifecycle_reference_errors(events))
     if errors:
         print("\n".join(errors), file=sys.stderr)
         print(f"校验失败：{len(events)} 条事件，{len(errors)} 个错误", file=sys.stderr)
@@ -750,6 +774,16 @@ def command_audit(root: Path, args: argparse.Namespace) -> int:
     ambiguous = {key for values in replacements.values() if len(values) > 1 for key in values}
     cutoff = utc_now() - dt.timedelta(days=args.stale_days)
     selected = select_events(events, args)
+    selected_ids = {event["event_id"] for event in selected}
+    lifecycle_errors = lifecycle_reference_errors(events)
+    issues.extend({**item, "source": sources[item["event_id"]]}
+                  for item in lifecycle_errors if item["event_id"] in selected_ids)
+    if not lifecycle_errors and not cyclic:
+        for task in task_states(events).values():
+            if task["state"] == "conflict" and any(e["event_id"] in selected_ids for e in task["heads"]):
+                issues.append({"kind": "task_state_conflict", "task_id": task["task_id"],
+                               "detail": f"任务 {task['task_id']} 有多个有效状态 head",
+                               "heads": [e["event_id"] for e in task["heads"]]})
     for event in selected:
         kinds = []
         content = event["content"]

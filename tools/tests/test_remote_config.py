@@ -78,7 +78,11 @@ def test_invalid_profile_fails_closed(config):
         settings_for_profile(config)
 
 
-def test_factory_applies_workspace_settings_without_launching_claude(tmp_path):
+@pytest.mark.parametrize("interval,progress_env,stream_env,expected", [
+    (None, None, None, 5), (7, "11", "13", 7), (0, None, None, 0),
+    (None, "11", "13", 11), (None, None, "13", 13),
+])
+def test_factory_applies_workspace_settings_without_launching_claude(tmp_path, interval, progress_env, stream_env, expected):
     credentials = tmp_path / "env"
     credentials.write_text(
         "FEISHU_APP_ID=test\nFEISHU_APP_SECRET=test\nFEISHU_ALLOW_OPEN_IDS=allowed\n"
@@ -95,6 +99,8 @@ def test_factory_applies_workspace_settings_without_launching_claude(tmp_path):
         "claude_cli": sys.executable,
         "workdir": str(tmp_path),
     }
+    if interval is not None:
+        config["progress_interval_seconds"] = interval
     script = """
 import json,sys
 import lark_oapi
@@ -106,6 +112,7 @@ with patch("subprocess.Popen") as spawn:
     from tools.claude_feishu import bridge
     assert bridge.SETTINGS.endswith("claude-settings.workspace.json")
     assert bridge.WORKDIR == sys.argv[4]
+    assert bridge.STREAM_INTERVAL == int(sys.argv[5])
     assert app.snapshot()["permission_profile"] == "workspace"
     spawn.assert_not_called()
     print("PROFILE_OK")
@@ -119,9 +126,14 @@ with patch("subprocess.Popen") as spawn:
             str(tmp_path / "config.json"),
             str(state),
             str(tmp_path),
+            str(expected),
         ],
         cwd=ROOT,
-        env={**os.environ, "AGENTS_LOCAL_ROOT": str(tmp_path / "local")},
+        env={**{k: v for k, v in os.environ.items() if k not in (
+            "CLAUDE_FEISHU_PROGRESS_INTERVAL", "CLAUDE_FEISHU_STREAM_INTERVAL")},
+             **({"CLAUDE_FEISHU_PROGRESS_INTERVAL": progress_env} if progress_env is not None else {}),
+             **({"CLAUDE_FEISHU_STREAM_INTERVAL": stream_env} if stream_env is not None else {}),
+             "AGENTS_LOCAL_ROOT": str(tmp_path / "local")},
         text=True,
         capture_output=True,
         timeout=20,

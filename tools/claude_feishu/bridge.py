@@ -60,12 +60,11 @@ ALLOW_OPEN_IDS = {
 OPEN_MODE = os.environ.get("FEISHU_OPEN_MODE", "") == "1"
 MAX_REPLY = 3800  # 单条消息字符上限（长回复分块发送）
 EXEC_TIMEOUT = int(os.environ.get("CLAUDE_FEISHU_TIMEOUT", "600"))  # 单条指令上限
-PROGRESS_INTERVAL = int(
-    os.environ.get("CLAUDE_FEISHU_PROGRESS_INTERVAL", "600")
-)  # 执行中的进行中提醒间隔（保底；流式进度见下）
 # 流式进度：解析 claude 的 stream-json 事件，按此间隔刷新同一张飞书卡片。
-# 设 0 关闭流式进度（退回只有结束才回复的旧行为）。
-STREAM_INTERVAL = int(os.environ.get("CLAUDE_FEISHU_STREAM_INTERVAL", "5"))
+# 设 0 关闭中间刷新，仍发送开始/结束卡片；兼容旧 STREAM 环境变量。
+STREAM_INTERVAL = int(os.environ.get(
+    "CLAUDE_FEISHU_PROGRESS_INTERVAL", os.environ.get("CLAUDE_FEISHU_STREAM_INTERVAL", "5")
+))
 THINKING_MAX = 200  # 进度卡片里思考摘要的字数上限（手机端一屏内）
 STEPS_MAX = 40  # RunState 保留的步骤条数（内存上限）
 STEPS_SHOWN = 5  # 进度卡片里展示的最近步骤条数

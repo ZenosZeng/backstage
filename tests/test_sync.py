@@ -3,6 +3,7 @@ from __future__ import annotations
 import importlib.util
 import json
 import shutil
+import subprocess
 import sys
 import threading
 import time
@@ -128,6 +129,62 @@ class SyncTest(unittest.TestCase):
         source, target = mirror.call_args.args
         self.assertNotEqual(source, self.root / ".share" / "memory" / "machine-a")
         self.assertEqual(target, "bos/bucket/agent-memory-v2/memory/machine-a")
+
+    def lifecycle_daily(self, base, machine, marker, supersedes=()):
+        path = self.write_daily(base, machine, "codex", marker)
+        document = json.loads(path.read_text())
+        document["events"][0].update(task_id="test-task", event_type="decision",
+                                     content={"task_state": "closed", "what": "test", "where": ["fixture"]},
+                                     supersedes=list(supersedes))
+        path.write_text(json.dumps(document))
+        return path
+
+    def test_pull_validates_lifecycle_against_local_and_remote_union(self):
+        owned = self.lifecycle_daily(self.root / ".share/memory", "machine-a", "parent")
+        remote = Path(self.temporary.name) / "remote-memory"
+        child = self.lifecycle_daily(remote, "machine-b", "child", ["parent"])
+        before = owned.read_bytes()
+        def download(_source, target, **_kwargs):
+            shutil.copytree(remote, target, dirs_exist_ok=True)
+        with mock.patch.object(SYNC, "remote_has_objects", return_value=True), \
+             mock.patch.object(SYNC, "mirror", side_effect=download):
+            SYNC.pull_other_memory(self.root, self.config, dry_run=False)
+            self.assertEqual(owned.read_bytes(), before)
+            self.assertEqual(SYNC.memory_store.task_states(SYNC.memory_store.load_events(self.root)[0])["test-task"]["state"], "closed")
+            document = json.loads(child.read_text())
+            document["events"].append({**document["events"][0], "event_id": "bad", "supersedes": ["missing"]})
+            child.write_text(json.dumps(document))
+            self.write_daily(remote, "machine-c", "claude", "innocent")
+            snapshots = {str(p): p.read_bytes() for p in (self.root / ".share/memory").rglob("*.json")}
+            with self.assertRaisesRegex(SYNC.SyncError, "生命周期引用无效"):
+                SYNC.pull_other_memory(self.root, self.config, dry_run=False)
+            self.assertEqual(snapshots, {str(p): p.read_bytes() for p in (self.root / ".share/memory").rglob("*.json")})
+
+    def test_push_rejects_invalid_lifecycle_before_network_write(self):
+        self.lifecycle_daily(self.root / ".share/memory", "machine-a", "child", ["missing"])
+        for push in (SYNC.push_memory, SYNC.push_all_memory):
+            with mock.patch.object(SYNC, "mirror") as upload:
+                with self.assertRaisesRegex(SYNC.SyncError, "任务状态引用无效"):
+                    push(self.root, self.config, dry_run=False)
+                upload.assert_not_called()
+
+    def test_push_owned_lifecycle_can_reference_other_machine(self):
+        self.lifecycle_daily(self.root / ".share/memory", "machine-b", "parent")
+        self.lifecycle_daily(self.root / ".share/memory", "machine-a", "child", ["parent"])
+        with mock.patch.object(SYNC, "mirror") as upload:
+            SYNC.push_memory(self.root, self.config, dry_run=False)
+            upload.assert_called_once()
+
+    def test_private_config_backups_are_ignored_but_template_is_trackable(self):
+        repo = Path(self.temporary.name) / "git-check"
+        repo.mkdir()
+        shutil.copy2(SCRIPT.parent.parent / ".gitignore", repo / ".gitignore")
+        subprocess.run(["git", "init", "-q", str(repo)], check=True)
+        for name in ("config.json", "config.json.bak-20260916", "config.json.backup", "config.json~"):
+            result = subprocess.run(["git", "-C", str(repo), "check-ignore", "-q", name])
+            self.assertEqual(result.returncode, 0, name)
+        result = subprocess.run(["git", "-C", str(repo), "check-ignore", "-q", "config.template.json"])
+        self.assertEqual(result.returncode, 1)
 
     def test_pull_memory_preserves_owned_prefix(self) -> None:
         local_owned = self.write_daily(self.root / ".share" / "memory", "machine-a", "codex", "local-new")

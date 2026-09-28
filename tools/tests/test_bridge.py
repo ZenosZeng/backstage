@@ -164,7 +164,7 @@ class ReplayGuardTests(unittest.TestCase):
 
 
 class RunClaudeProgressTests(unittest.TestCase):
-    """长任务执行：按 PROGRESS_INTERVAL 分片等待并回调 on_progress，总时长受 EXEC_TIMEOUT 约束。"""
+    """长任务执行：按 STREAM_INTERVAL 刷新进度，总时长受 EXEC_TIMEOUT 约束。"""
 
     @classmethod
     def setUpClass(cls):

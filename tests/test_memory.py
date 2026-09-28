@@ -387,8 +387,10 @@ class MemoryCliTest(unittest.TestCase):
             event = self.lifecycle_event("bad", "active")
             event.update(changes)
             self.assertEqual(self.import_events([event], check=False).returncode, 2)
-        self.import_events([self.lifecycle_event("dangling", "closed", supersedes=["absent"])])
-        self.assertEqual(self.run_cli("brief", "--project", "repo-a", check=False).returncode, 2)
+        self.assertEqual(self.import_events([
+            self.lifecycle_event("dangling", "closed", supersedes=["absent"])
+        ], check=False).returncode, 2)
+        self.assertFalse(json.loads(self.run_cli("recent", "--json").stdout))
 
     def test_brief_reads_global_lifecycle_before_date_and_agent_filters(self):
         self.import_events([
@@ -459,8 +461,65 @@ class MemoryCliTest(unittest.TestCase):
     def test_cross_task_lifecycle_reference_is_not_a_valid_close(self):
         other = self.lifecycle_event("other", "active")
         other["task_id"] = "another-task"
-        self.import_events([other, self.lifecycle_event("close", "closed", supersedes=["other"])])
-        self.assertEqual(self.run_cli("brief", "--project", "repo-a", check=False).returncode, 2)
+        self.assertEqual(self.import_events([
+            other, self.lifecycle_event("close", "closed", supersedes=["other"])
+        ], check=False).returncode, 2)
+        self.assertFalse(json.loads(self.run_cli("recent", "--json").stdout))
+
+    def test_lifecycle_import_rejects_invalid_edges_atomically(self):
+        self.add("existing")
+        before = {str(p): p.read_bytes() for p in (self.root / ".share").rglob("*.json")}
+        cases = [
+            [self.sample_event("fact"), self.lifecycle_event("state", "active", supersedes=["fact"])],
+            [self.lifecycle_event("a", "active", supersedes=["b"]),
+             self.lifecycle_event("b", "closed", supersedes=["a"])],
+            [self.lifecycle_event("closed", "closed"), self.sample_event("bypass", supersedes=["closed"])],
+        ]
+        for events in cases:
+            with self.subTest(events=events):
+                self.assertEqual(self.import_events(events, check=False).returncode, 2)
+                self.assertEqual(before, {str(p): p.read_bytes() for p in (self.root / ".share").rglob("*.json")})
+
+    def test_ordinary_add_cannot_reopen_closed_task(self):
+        self.import_events([self.lifecycle_event("closed", "closed")])
+        result = self.run_cli("add", "--agent", "codex", "--task", "cross-repo-task",
+                              "--type", "progress", "--topic", "test", "--title", "correction",
+                              "--what", "ordinary correction", "--next", "restart",
+                              "--supersedes", "closed", check=False)
+        self.assertEqual(result.returncode, 2)
+        task = self.brief("--include-inactive")
+        self.assertEqual(task["tasks"][0]["state"], "closed")
+        self.assertFalse(task["sections"]["待办候选"])
+
+    def test_validate_and_audit_detect_legacy_invalid_lifecycle(self):
+        self.import_events([self.lifecycle_event("state", "active")])
+        path = next((self.root / ".share").rglob("*.json"))
+        document = json.loads(path.read_text())
+        document["events"][0]["supersedes"] = ["absent"]
+        path.write_text(json.dumps(document))
+        self.assertEqual(self.run_cli("validate", check=False).returncode, 1)
+        result = self.run_cli("audit", "--json", check=False)
+        self.assertEqual(result.returncode, 1)
+        self.assertEqual(json.loads(result.stdout)["counts"]["invalid_lifecycle_reference"], 1)
+
+    def test_audit_reports_independent_heads_and_clears_after_resolution(self):
+        self.import_events([self.lifecycle_event("a", "active"),
+                            self.lifecycle_event("b", "closed", machine_id="machine-b")])
+        result = self.run_cli("audit", "--task", "cross-repo-task", "--json", check=False)
+        self.assertEqual(result.returncode, 1)
+        issues = json.loads(result.stdout)["issues"]
+        conflict = next(i for i in issues if i["kind"] == "task_state_conflict")
+        self.assertEqual(set(conflict["heads"]), {"a", "b"})
+        self.assertEqual(self.run_cli("audit", "--task", "unrelated", check=False).returncode, 0)
+        self.transition("active", "--resolve", "a", "--resolve", "b")
+        result = json.loads(self.run_cli("audit", "--json", check=False).stdout)
+        self.assertNotIn("task_state_conflict", result["counts"])
+
+    def test_lifecycle_batch_order_does_not_matter(self):
+        self.import_events([self.lifecycle_event("closed", "closed", supersedes=["active"]),
+                            self.lifecycle_event("active", "active", machine_id="machine-b")])
+        self.assertEqual(self.brief("--include-inactive")["tasks"][0]["state"], "closed")
+        self.assertEqual(self.run_cli("validate").returncode, 0)
 
     def test_task_does_not_mutate_on_invalid_or_sensitive_input(self):
         self.add("existing")

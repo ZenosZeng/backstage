@@ -252,6 +252,10 @@ def push_memory(root: Path, config: dict[str, Any], *, dry_run: bool) -> None:
         with tempfile.TemporaryDirectory(prefix="agent-memory-push-") as temporary:
             snapshot = Path(temporary) / machine_id
             with memory_store.operation_lock(root, "memory-write"):
+                events, errors = memory_store.load_events(root)
+                errors.extend(item["detail"] for item in memory_store.lifecycle_reference_errors(events))
+                if errors:
+                    raise SyncError("本地记忆校验失败：" + "；".join(errors))
                 for path in source.glob("*/*.json"):
                     document = memory_store.read_daily(path)
                     atomic_write_json(snapshot / path.relative_to(source), document)
@@ -271,6 +275,10 @@ def push_all_memory(root: Path, config: dict[str, Any], *, dry_run: bool) -> Non
         with tempfile.TemporaryDirectory(prefix="agent-memory-init-") as temporary:
             snapshot = Path(temporary)
             with memory_store.operation_lock(root, "memory-write"):
+                events, errors = memory_store.load_events(root)
+                errors.extend(item["detail"] for item in memory_store.lifecycle_reference_errors(events))
+                if errors:
+                    raise SyncError("本地记忆校验失败：" + "；".join(errors))
                 for path in source.glob("*/*/*.json"):
                     atomic_write_json(snapshot / path.relative_to(source), memory_store.read_daily(path))
             validate_daily_files(snapshot)
@@ -334,6 +342,10 @@ def _pull_other_memory(root: Path, config: dict[str, Any], *, dry_run: bool, inc
                     f"远端 raw memory 回退或改写（缺失 {len(missing)}，冲突 {len(changed)}），"
                     f"未安装；请核验 {report}。脱敏改写也需人工确认，不自动合并。"
                 )
+            merged = {**local, **incoming}
+            reference_errors = memory_store.lifecycle_reference_errors(list(merged.values()))
+            if reference_errors:
+                raise SyncError("远端生命周期引用无效，未安装：" + "；".join(item["detail"] for item in reference_errors))
             for target, document in documents:
                 if not target.exists() or memory_store.read_daily(target) != document:
                     atomic_write_json(target, document)

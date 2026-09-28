@@ -2,6 +2,6 @@
   "credentials_file": "~/.config/claude-feishu/env",
   "workdir": "~/code",
   "timeout_seconds": 600,
-  "progress_interval_seconds": 600,
+  "progress_interval_seconds": 5,
   "permission_profile": "read-only"
 }

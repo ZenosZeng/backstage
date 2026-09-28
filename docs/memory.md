@@ -195,16 +195,45 @@ python3 scripts/sync.py publish-shared-file \
 （`--summary-chars 240`），`--full` 查看完整正文；`--json` 仍返回完整 event array。
 `recent` 保持原有时间倒序及全文默认值，可加 `--summary`。
 
+## 精简上下文与任务生命周期
+
+```bash
+pixi run memory brief --project repo-name --max-chars 6000
+pixi run memory brief --task release-check
+pixi run memory search "接口" --sort recent --full
+pixi run memory search "接口" --json
+```
+
+`brief` 展示约定与决策、事实与验证记录、进展、风险和待办候选。完全相同的内容合并
+展示但保留全部来源；不同结论并列，不自动把最新说法当作正确说法。默认最多 20 组，
+在前四类内容间轮流分配名额，各类内部按时间倒序，避免进展挤掉约束；每条 240 字符，
+文本总计 6000 字符。可用 `get <event_id>` 展开完整依据。
+
 `brief --project <name>` / `brief --task <id>` 提供按来源摘录的精简上下文，始终排除
 显式取代事件。任务状态在日期、作者和项目过滤之前从全部事件解析，不能用旧日期窗口
 绕过后来的暂停/关闭。`--limit` 控制记录组数，`--summary-chars` 控制单条摘要，
 `--max-chars` 控制文本总长度（JSON 不做总长度截断）。未展示条目数和文本截断会提示。
 这不是长期记忆整理器：不读写长期 Markdown、不调用模型、不根据标题猜任务是否结束。
 
+```bash
+pixi run memory task --task release-check --state active --agent codex \
+  --project repo-a --project repo-b --reason "验证跨仓库接口" --where "需求单 #123"
+pixi run memory task --task release-check --state paused --agent claude \
+  --reason "等待测试机器" --where "用户暂停指令"
+pixi run memory task --task release-check --state closed --agent codex \
+  --reason "验收完成" --where "测试报告与 PR #456"
+```
+
+恢复用 `--state active`。已有任务可直接暂停/关闭，无需补建；后续状态事件继承 repo
+关联。状态记录不执行暂停、取消作业或合并 PR 等外部操作。
+
 `task --task <id> --state active|paused|closed --agent <agent> --reason <原因>
 --where <依据>` 追加生命周期决定，首次创建可重复传 `--project` 关联多个仓库。
 使用 schema v1 的 `decision` + `content.task_state`，`supersedes` 仅引用同任务先前
 的生命周期记录；不会取代事实、风险或测试记录。任务 ID 是工作区内的稳定唯一标识。
+普通事件也不能取代生命周期事件。追加/导入会对现有事件与整个批次合并校验，允许批次
+内父子乱序；生命周期引用缺失、跨任务、跨类型或成环时整批拒绝写入。同步安装前对本机
+与远端事件联合校验，支持跨机器引用；发现非法引用不会部分安装新文件。
 同机操作在现有 memory-write 锁内读取 heads 并原子追加；跨机同时追加会留下多个 heads，
 显示冲突，不按时间戳裁决。人工核对后，用重复 `--resolve` 指定全部 heads 追加解决记录。
 
@@ -214,8 +243,13 @@ python3 scripts/sync.py publish-shared-file \
 它仍可能过时，不代表执行授权。普通 `add` 不改变任务生命周期，重开必须显式设 active。
 跨机器使用前先同步，CLI 不自动发布到 S3；旧工具能读取事件但不理解生命周期投影。
 
+## 审计与退出码
+
 `audit` 默认检查全部事件，支持相同筛选和 `--stale-days`（默认 60 天）。它只报告
 缺来源、过期候选、悬空/循环 supersedes、并行取代候选及历史时间格式，不重写记忆。
+生命周期非法引用也会使 `validate` 失败；`audit` 报告 `invalid_lifecycle_reference` 或
+`lifecycle_cycle`。多个有效状态 head 报告 `task_state_conflict`，包括没有共同父记录的
+独立创建；合法并发冲突可同步保存，由 Agent 核对后解决，不按时间自动裁决。
 正常查询成功返回 0；`get` 未找到、`audit` 有待核验项、`validate` 校验失败返回 1；
 参数、I/O 或冲突错误返回 2。历史非 UTC 时间和日期错位保留原始来源，仅审计提示。
 
@@ -268,6 +302,11 @@ python3 scripts/sync.py resolve-shared
 ```
 
 `resolve-shared` 上传前会再次检查 S3。如果人工合并期间远端再次变化，操作会停止并要求重新合并。
+
+整包上传还会拒绝三类同路径风险：本地仍为基线旧版、双方修改且内容不同、远端删除而
+本地仍保留基线原文。哈希不能判定第三版是否正确合并；请保留本地修改，先从冲突快照
+对齐受阻路径（含采纳删除）并 resolve，再重新应用、核对和发布本地修改。本地单侧修改、
+双方内容一致可正常通过；远端删除而本地已编辑的文件仍由人工决定是否保留。
 
 `--allow-non-writer` 仅用于用户明确授权的维护迁移，不会绕过分叉检测。
 
