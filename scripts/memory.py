@@ -31,6 +31,7 @@ EVENT_TYPES = {
     "preference",
 }
 STATUSES = {"active", "superseded", "resolved", "needs_verification"}
+TASK_STATES = {"active", "paused", "closed"}
 SENSITIVE_KEYS = {
     "api_key",
     "apikey",
@@ -210,6 +211,16 @@ def validate_event(event: dict[str, Any]) -> list[str]:
         errors.append("created_at 不是有效 ISO-8601 时间")
     if not isinstance(event.get("content"), dict):
         errors.append("content 必须是 object")
+    elif "task_state" in event["content"]:
+        state = event["content"]["task_state"]
+        if not isinstance(state, str) or state not in TASK_STATES:
+            errors.append("task_state 必须是 active、paused 或 closed")
+        if not isinstance(event.get("task_id"), str) or not event["task_id"].strip():
+            errors.append("任务状态事件必须有 task_id")
+        if event.get("event_type") != "decision":
+            errors.append("任务状态事件必须使用 decision 类型")
+        if not event["content"].get("what") or not event["content"].get("where"):
+            errors.append("任务状态事件必须记录原因 what 和来源 where")
     if not isinstance(event.get("projects"), list):
         errors.append("projects 必须是 array")
     supersedes = event.get("supersedes", [])
@@ -366,16 +377,21 @@ def load_events(root: Path) -> tuple[list[dict[str, Any]], list[str]]:
     return events, errors
 
 
-def render_event(event: dict[str, Any]) -> str:
+def short_text(value: Any, size: int) -> str:
+    text = " ".join(str(value).split())
+    return text if len(text) <= size else text[:size - 1] + "…"
+
+
+def render_event(event: dict[str, Any], summary_chars: int | None = None) -> str:
     projects = ", ".join(project.get("name", "?") for project in event["projects"]) or "-"
     what = event.get("content", {}).get("what", "")
     lines = [
-        f"[{event['created_at']}] {event['title']}",
+        f"[{event['created_at']}] {short_text(event['title'], summary_chars) if summary_chars else event['title']}",
         f"  {event['machine_id']}/{event['agent']} | {event['event_type']}/{event['status']} | {projects}",
         f"  topic={event['topic_key']} task={event.get('task_id') or '-'} id={event['event_id']}",
     ]
     if what:
-        lines.append(f"  {what}")
+        lines.append(f"  {short_text(what, summary_chars) if summary_chars else what}")
     return "\n".join(lines)
 
 
@@ -434,7 +450,175 @@ def select_events(events: list[dict[str, Any]], args: argparse.Namespace) -> lis
             if all(term in json.dumps(event, ensure_ascii=False).casefold() for term in terms)
         ]
     selected.reverse()
+    if query and getattr(args, "sort", "recent") == "relevance":
+        selected.sort(key=lambda event: relevance_score(event, terms), reverse=True)
     return selected[: args.limit]
+
+
+def relevance_score(event: dict[str, Any], terms: list[str]) -> int:
+    fields = [
+        (event["title"], 8), (event["topic_key"], 6),
+        (event.get("task_id") or "", 5),
+        (" ".join(p.get("name", "") for p in event["projects"]), 4),
+        (json.dumps(event["content"], ensure_ascii=False), 1),
+    ]
+    return sum(weight for text, weight in fields for term in terms if term in text.casefold())
+
+
+def task_states(events: list[dict[str, Any]]) -> dict[str, dict[str, Any]]:
+    """Project explicit lifecycle heads; ordinary progress never reopens a task."""
+    if supersedes_cycles(events):
+        raise ValueError("supersedes 存在环，请先运行 audit")
+    replaced = {key for event in events for key in event.get("supersedes", [])}
+    tasks: dict[str, dict[str, Any]] = {}
+    by_id = {event["event_id"]: event for event in events}
+    for event in events:
+        task = event.get("task_id")
+        if not task:
+            continue
+        item = tasks.setdefault(task, {"task_id": task, "state": "unknown", "heads": [], "projects": []})
+        item["projects"] = sorted(set(item["projects"]) | {p["name"] for p in event["projects"]})
+        if "task_state" not in event["content"]:
+            continue
+        for parent_id in event.get("supersedes", []):
+            parent = by_id.get(parent_id)
+            if parent is None or parent.get("task_id") != task or "task_state" not in parent["content"]:
+                raise ValueError(f"任务状态引用无效：{event['event_id']}；父记录必须是同任务状态事件")
+        if event["event_id"] not in replaced and event["status"] != "superseded":
+            item["heads"].append(event)
+    for item in tasks.values():
+        if len(item["heads"]) == 1:
+            item["state"] = item["heads"][0]["content"]["task_state"]
+        elif len(item["heads"]) > 1:
+            item["state"] = "conflict"
+    return tasks
+
+
+def command_task(root: Path, args: argparse.Namespace) -> int:
+    if not args.task.strip() or not args.reason.strip() or not all(s.strip() for s in args.where):
+        raise ValueError("task、reason 和 where 不得为空白")
+    config = load_config(root)
+    # Read heads and append under the same existing write lock (same-machine writers).
+    with operation_lock(root, "memory-write"):
+        events, errors = load_events(root)
+        if errors:
+            raise ValueError("记忆库校验失败，请先运行 validate")
+        tasks = task_states(events)
+        current = tasks.get(args.task)
+        if current is None and args.state != "active":
+            raise ValueError("未知任务；先用 active 建立任务或追加带该 task ID 的记忆")
+        heads = current["heads"] if current else []
+        if len(heads) > 1 and set(args.resolve) != {e["event_id"] for e in heads}:
+            raise ValueError("任务状态冲突；核对后用 --resolve 逐个指定全部 head event_id")
+        if args.resolve and set(args.resolve) != {e["event_id"] for e in heads}:
+            raise ValueError("--resolve 与当前任务 heads 不一致，请重新读取")
+        projects = {p["name"]: {"name": p["name"]}
+                    for e in events if e.get("task_id") == args.task for p in e["projects"]}
+        registered = [name for name in projects if name in config.get("projects", {})]
+        # Capture this decision's checkout, not the commit copied from an old event.
+        projects.update({p["name"]: p for p in project_metadata(config, registered + args.project)})
+        now = utc_now()
+        event = {
+            "schema_version": 1,
+            "event_id": f"evt_{now.strftime('%Y%m%dT%H%M%S.%fZ')}_{config['machine_id']}_{args.agent}_{uuid.uuid4().hex}",
+            "created_at": iso_utc(now), "machine_id": config["machine_id"], "agent": args.agent,
+            "workspace": config["workspace"], "scope": "task", "task_id": args.task,
+            "projects": list(projects.values()), "event_type": "decision",
+            "topic_key": f"task/{args.task}/lifecycle", "title": f"任务 {args.task}: {args.state}",
+            "content": {"task_state": args.state, "what": args.reason, "where": args.where},
+            "status": "active", "supersedes": [e["event_id"] for e in heads], "sensitivity": "normal",
+        }
+        _append_events(root, [event])
+    print(f"任务 {args.task}: {args.state}；来源 {event['event_id']}")
+    return 0
+
+
+def command_brief(root: Path, args: argparse.Namespace) -> int:
+    if not args.project and not args.task:
+        raise ValueError("brief 至少指定 --project 或 --task")
+    events, errors = load_events(root)
+    if errors:
+        raise ValueError("记忆库校验失败，请先运行 validate")
+    states = task_states(events)
+    selectors = argparse.Namespace(**vars(args))
+    selectors.current, selectors.limit = True, None
+    selected = select_events(events, selectors)
+    related = [item for task, item in sorted(states.items())
+               if (not args.task or task == args.task)
+               and (not args.project or args.project in item["projects"])]
+    visible = [item for item in related if args.task or args.include_inactive
+               or item["state"] not in {"paused", "closed"}]
+    hidden = len(related) - len(visible)
+    selected = [e for e in selected if args.task or args.include_inactive
+                or states.get(e.get("task_id"), {}).get("state") not in {"paused", "closed"}]
+    # Exact duplicate content can be collapsed, but preserve every source ID.
+    groups: dict[tuple, dict[str, Any]] = {}
+    for event in selected:
+        if "task_state" in event["content"]:
+            continue
+        key = (event.get("task_id"), event["topic_key"], event["event_type"], event["status"],
+               json.dumps(event["content"], ensure_ascii=False, sort_keys=True))
+        if key not in groups:
+            groups[key] = {"event": event, "sources": []}
+        groups[key]["sources"].append(event["event_id"])
+    sections: dict[str, list] = {name: [] for name in ("约定与决策", "事实与验证记录", "当前进展", "风险与待验证", "待办候选")}
+    buckets: dict[str, list] = {name: [] for name in sections if name != "待办候选"}
+    for group in groups.values():
+        event = group["event"]
+        kind = event["event_type"]
+        section = ("风险与待验证" if kind in {"risk", "hypothesis"} or event["status"] == "needs_verification"
+                   else "约定与决策" if kind in {"decision", "preference", "config"}
+                   else "当前进展" if kind == "progress" else "事实与验证记录")
+        buckets[section].append(group)
+    # Share the budget across categories so fresh progress cannot bury constraints.
+    picked = []
+    for index in range(max((len(b) for b in buckets.values()), default=0)):
+        for section, bucket in buckets.items():
+            if index < len(bucket) and len(picked) < args.limit:
+                picked.append((section, bucket[index]))
+        if len(picked) >= args.limit:
+            break
+    for section, group in picked:
+        event = group["event"]
+        kind = event["event_type"]
+        entry = {"title": short_text(event["title"], args.summary_chars),
+                 "text": short_text(event["content"].get("what", ""), args.summary_chars),
+                 "sources": group["sources"], "created_at": event["created_at"],
+                 "agent": event["agent"], "machine": event["machine_id"],
+                 "projects": [p["name"] for p in event["projects"]],
+                 "type": kind, "status": event["status"], "task_id": event.get("task_id")}
+        sections[section].append(entry)
+        task = event.get("task_id")
+        if task and states[task]["state"] in {"active", "unknown"} and event["status"] == "active":
+            todo = event["content"].get("next", [])
+            if todo:
+                sections["待办候选"].append({**entry, "text": short_text(todo, args.summary_chars)})
+    result = {
+        "notice": "仅摘录记忆，不裁决事实；同 topic 并列不表示一致。unknown 任务尚未声明生命周期；待办需核对源码与现场。",
+        "tasks": [{"task_id": item["task_id"], "state": item["state"], "projects": item["projects"],
+                   "heads": [{"event_id": e["event_id"], "state": e["content"]["task_state"],
+                              "created_at": e["created_at"], "agent": e["agent"], "machine": e["machine_id"],
+                              "reason": short_text(e["content"]["what"], args.summary_chars),
+                              "where": e["content"]["where"]} for e in item["heads"]]} for item in visible],
+        "hidden_inactive_tasks": hidden, "omitted_events": max(0, len(groups) - args.limit), "sections": sections,
+    }
+    if args.json:
+        print(json.dumps(result, ensure_ascii=False, indent=2))
+    else:
+        lines = [result["notice"], f"隐藏暂停/关闭任务 {hidden}；未展示记录组 {result['omitted_events']}"]
+        for item in result["tasks"]:
+            lines.append(f"任务 {item['task_id']}: {item['state']}")
+            for head in item["heads"]:
+                lines.append(f"  [{head['event_id']}] {head['state']}: {head['reason']}")
+        for name, entries in sections.items():
+            if entries:
+                lines.append(f"\n{name}")
+            for entry in entries:
+                lines.append(f"- {entry['title']} ({entry['created_at']}; {entry['machine']}/{entry['agent']}; {entry['type']}/{entry['status']})\n  {entry['text']}\n  来源: {', '.join(entry['sources'])}")
+        output = "\n".join(lines)
+        suffix = "\n[输出已截断；用 --max-chars 增大上限、--task 缩小范围或 --json 查看全部摘要。]"
+        print(output if len(output) <= args.max_chars else (output[:max(0, args.max_chars - len(suffix))] + suffix)[:args.max_chars])
+    return 0
 
 
 def command_add(root: Path, args: argparse.Namespace) -> int:
@@ -495,7 +679,8 @@ def command_list(root: Path, args: argparse.Namespace) -> int:
     if args.json:
         print(json.dumps(selected, ensure_ascii=False, indent=2))
     elif selected:
-        print("\n\n".join(render_event(event) for event in selected))
+        size = args.summary_chars if getattr(args, "summary", False) else None
+        print("\n\n".join(render_event(event, size) for event in selected))
     else:
         print("没有匹配的记忆。")
     return 0
@@ -662,11 +847,35 @@ def parser() -> argparse.ArgumentParser:
     search = subparsers.add_parser("search", help="搜索原始记忆")
     search.add_argument("query")
     add_filters(search)
-    search.set_defaults(func=command_list)
+    search.add_argument("--sort", choices=("relevance", "recent"), default="relevance")
+    search.add_argument("--summary-chars", type=positive_int, default=240)
+    search_format = search.add_mutually_exclusive_group()
+    search_format.add_argument("--summary", dest="summary", action="store_true")
+    search_format.add_argument("--full", dest="summary", action="store_false")
+    search.set_defaults(func=command_list, summary=True)
 
     recent = subparsers.add_parser("recent", help="读取最近记忆")
     add_filters(recent)
+    recent.add_argument("--summary", action="store_true")
+    recent.add_argument("--summary-chars", type=positive_int, default=240)
     recent.set_defaults(func=command_list)
+
+    task = subparsers.add_parser("task", help="追加任务生命周期决定，不改历史记录")
+    task.add_argument("--task", required=True, help="工作区内唯一、跨 repo 稳定 task ID")
+    task.add_argument("--state", required=True, choices=sorted(TASK_STATES))
+    task.add_argument("--agent", required=True, choices=("codex", "claude", "kimi"))
+    task.add_argument("--project", action="append", default=[])
+    task.add_argument("--reason", required=True)
+    task.add_argument("--where", action="append", required=True, help="决定依据/来源")
+    task.add_argument("--resolve", action="append", default=[], help="明确取代的冲突 head ID；需列全")
+    task.set_defaults(func=command_task)
+
+    brief = subparsers.add_parser("brief", help="按项目或任务生成有来源的精简上下文")
+    add_filters(brief)
+    brief.add_argument("--include-inactive", action="store_true", help="包含暂停/关闭任务的历史，不推荐其待办")
+    brief.add_argument("--summary-chars", type=positive_int, default=240)
+    brief.add_argument("--max-chars", type=positive_int, default=6000, help="文本总字符上限；JSON 不截断")
+    brief.set_defaults(func=command_brief, current=True)
 
     import_events = subparsers.add_parser("import", help="幂等导入 event array")
     import_events.add_argument("--input", required=True)

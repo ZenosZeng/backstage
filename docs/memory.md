@@ -190,6 +190,30 @@ python3 scripts/sync.py publish-shared-file \
 `--current` 排除显式 superseded 的事件，不代表已验证，也不会自动合并同 topic 的不同结论。
 写周报/月报时保留历史，不加 `--current`。`get` 返回完整事件和真实来源路径。
 
+`search` 默认按相关性排序：标题、topic、task ID、project 命中优先于正文；同分按时间
+倒序。空格分隔关键词仍为 AND 匹配，`--sort recent` 恢复旧排序。文本默认短摘要
+（`--summary-chars 240`），`--full` 查看完整正文；`--json` 仍返回完整 event array。
+`recent` 保持原有时间倒序及全文默认值，可加 `--summary`。
+
+`brief --project <name>` / `brief --task <id>` 提供按来源摘录的精简上下文，始终排除
+显式取代事件。任务状态在日期、作者和项目过滤之前从全部事件解析，不能用旧日期窗口
+绕过后来的暂停/关闭。`--limit` 控制记录组数，`--summary-chars` 控制单条摘要，
+`--max-chars` 控制文本总长度（JSON 不做总长度截断）。未展示条目数和文本截断会提示。
+这不是长期记忆整理器：不读写长期 Markdown、不调用模型、不根据标题猜任务是否结束。
+
+`task --task <id> --state active|paused|closed --agent <agent> --reason <原因>
+--where <依据>` 追加生命周期决定，首次创建可重复传 `--project` 关联多个仓库。
+使用 schema v1 的 `decision` + `content.task_state`，`supersedes` 仅引用同任务先前
+的生命周期记录；不会取代事实、风险或测试记录。任务 ID 是工作区内的稳定唯一标识。
+同机操作在现有 memory-write 锁内读取 heads 并原子追加；跨机同时追加会留下多个 heads，
+显示冲突，不按时间戳裁决。人工核对后，用重复 `--resolve` 指定全部 heads 追加解决记录。
+
+默认项目 brief 隐藏 paused/closed 任务；显式 `--task` 或 `--include-inactive` 可展示，
+但不推荐其待办。冲突任务也不推荐待办。没有生命周期记录的旧任务保留为 unknown；
+仅有稳定 task ID 且状态 active/unknown 的 active 事件，其 next 字段才列为待办候选。
+它仍可能过时，不代表执行授权。普通 `add` 不改变任务生命周期，重开必须显式设 active。
+跨机器使用前先同步，CLI 不自动发布到 S3；旧工具能读取事件但不理解生命周期投影。
+
 `audit` 默认检查全部事件，支持相同筛选和 `--stale-days`（默认 60 天）。它只报告
 缺来源、过期候选、悬空/循环 supersedes、并行取代候选及历史时间格式，不重写记忆。
 正常查询成功返回 0；`get` 未找到、`audit` 有待核验项、`validate` 校验失败返回 1；

@@ -51,7 +51,8 @@ Codex / Claude Code / Kimi Code
 
 | 版本 | 日期 | 范围 |
 |---|---|---|
-| **v0.2.3 · 当前** | 2026-09-14 | `resolve-shared` 整包上传前新增同路径内容护栏：本地仍为基线旧版、双方都改过且内容不同、远端已删除而本地仍保留基线原文，三类均拒绝上传并列出路径（修复静默回退远端变更的事故）；远端删除、本地已编辑的文件仍由人工决定；新增回归用例，全量 159 例 |
+| **v0.3.0 · 当前** | 2026-09-28 | 新增 `memory brief` 精简上下文、任务暂停/关闭/重开与并发状态冲突处理、相关性排序和短摘要搜索；保留来源与历史，数据 `schema_version=1` 不变；全量 177 项测试通过；同步修正 Pixi 遗留版本号 |
+| **v0.2.3** | 2026-09-14 | `resolve-shared` 整包上传前新增同路径内容护栏：本地仍为基线旧版、双方都改过且内容不同、远端已删除而本地仍保留基线原文，三类均拒绝上传并列出路径（修复静默回退远端变更的事故）；远端删除、本地已编辑的文件仍由人工决定；新增回归用例，全量 159 例 |
 | **v0.2.2** | 2026-09-14 | 告警重发间隔可配置（默认 600s，降低推送频率）；**生命周期告警不再被限流**——进程启动/结束/异常退出是边沿事件，每次都是新事件，统一限流会让「死亡 → 重启 → 很快再次死亡」只报第一次，现在只有持续型告警（如 stalled）参与限流；补 runner 限流回归 4 例 |
 | **v0.2.1** | 2026-09-11 | 共享区目录重排（`agent/prompts`、`agent/skills`、`knowledge`、`docs`、`setup`）与 S3 前缀同步迁移；旧 skill 链接自动改指（用户自有配置不覆盖）；远端缺前缀视为空；raw 冲突不再中断共享同步与链接维护 |
 | **v0.2.0** | 2026-09-11 | 飞书遥控对齐终端：进度卡片显示思考/工具参数/工具输出/最近步骤，逐字流式，耗时与成本入卡；命令集 `/help /new /status /cd /cost /queue` 与按 chat 排队；修异常路径子进程清理、跨 chat 排队、会话落盘并发、排队 FIFO、上下文占比口径；回归 154 例 |
@@ -136,7 +137,8 @@ repo 注册表、指定共享 writer 时，请先阅读 [初始化说明](docs/m
 ```bash
 # 开始工作前同步，按需读取相关记忆
 pixi run sync sync
-pixi run memory recent --current --limit 10
+pixi run memory brief --project repo-name
+pixi run memory recent --current --summary --limit 10
 pixi run memory search "关键词" --current --limit 10
 
 # 查看完整来源或检查过期、冲突候选
@@ -150,6 +152,53 @@ pixi run tools-status
 
 通过共享 Skill 约定 Agent 主动记录有价值的事实、决策和验证结果，不必等到会话结束。
 原始事件按机器和 Agent 分区；长期知识是人工或 Agent 整理的 Markdown，不是自动裁决。
+
+### 快速恢复上下文
+
+```bash
+# 项目摘要；也可以 --task 指定一个跨 repo 的稳定任务 ID
+pixi run memory brief --project repo-name --max-chars 6000
+pixi run memory brief --task release-check
+
+# 搜索默认：相关性排序 + 每条正文最多 240 字符
+pixi run memory search "接口 契约" --project repo-name --current
+# 恢复按时间倒序、完整正文；JSON 始终保留完整事件
+pixi run memory search "接口" --sort recent --full
+pixi run memory search "接口" --json
+```
+
+`brief` 是确定性的摘录，不调用模型、不写文件：展示任务状态、约定与决策、事实与验证
+记录、进展、风险及待办候选。每项保留 event ID，可用 `get` 展开来源。完全相同的内容
+合并展示但保留全部来源；不同结论并列，不把最新说法自动当成正确说法。
+默认最多取 20 组记录，在四类内容间轮流分配名额，各类内部按时间倒序，避免进展挤掉约束。
+每条摘要 240 字符，文本总计 6000 字符；用 `--limit`、
+`--summary-chars`、`--max-chars` 调整。截断会提示，`--json` 不做总长度截断。
+
+### 任务暂停与收尾
+
+任务 ID 在工作区内唯一，多个 repo 共用同一个 ID，不依赖 Agent session。
+
+```bash
+pixi run memory task --task release-check --state active --agent codex \
+  --project repo-a --project repo-b --reason "验证跨仓库接口" --where "需求单 #123"
+pixi run memory task --task release-check --state paused --agent claude \
+  --reason "等待测试机器" --where "用户暂停指令"
+pixi run memory task --task release-check --state closed --agent codex \
+  --reason "验收完成" --where "测试报告与 PR #456"
+```
+
+- 每次操作追加一条普通 `decision` 事件（`content.task_state`），不覆盖历史、不新增状态数据库。
+- 恢复用 `--state active`；普通进展记录不会自动重开任务。后续状态记录继承任务的 repo 关联。
+- 未声明状态的旧任务显示 `unknown`，不擅自关闭。已有任务可直接暂停/关闭，无需补建。
+- 项目 `brief` 默认隐藏暂停/关闭任务；用 `--include-inactive` 或显式 `--task` 可查历史，
+  但不会推荐其旧待办。`search/recent/get` 仍可查询全部历史；`--current` 语义不变。
+- 同机读状态与追加共用现有写锁；跨机依赖同步后的事件引用检测冲突，不保证分布式事务。
+  多个未取代的状态 head 显示 `conflict`，不推荐该任务待办。核对后使用重复的
+  `--resolve <event_id>` 列出全部 head，附原因/来源，再追加新的状态决定。
+- 先同步再读写；`task` 本身不访问 S3。以上只是 CLI 示例，不会自动执行暂停、取消作业或合并 PR。
+
+老版本工具仍能把这些状态记录当普通决定读取，但不会执行新的生命周期筛选。
+各机器升级公共核心后才能使用这些命令；本次无需迁移历史记忆或更新长期 Markdown。
 
 工具升级走 Git，知识同步走 S3。单独同步 Skill 不会安装新工具代码或升级 CLI。
 查询筛选、首次发布和冲突恢复的完整说明见 [记忆与同步参考](docs/memory.md)。
