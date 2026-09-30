@@ -1,7 +1,12 @@
 {
   "credentials_file": "~/.config/claude-feishu/env",
+  "dsh_cli": "",
   "workdir": "~/code",
   "timeout_seconds": 600,
+  "dsh_timeout_seconds": 600,
   "progress_interval_seconds": 5,
-  "permission_profile": "read-only"
+  "permission_profile": "read-only",
+  "claude_model_name": "",
+  "dsh_model_name": "",
+  "dsh_context_window": 0
 }

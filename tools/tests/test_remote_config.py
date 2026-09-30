@@ -113,6 +113,8 @@ with patch("subprocess.Popen") as spawn:
     assert bridge.SETTINGS.endswith("claude-settings.workspace.json")
     assert bridge.WORKDIR == sys.argv[4]
     assert bridge.STREAM_INTERVAL == int(sys.argv[5])
+    assert bridge._build_env("dsh")["DSH_PERMISSION_MODE"] == "workspace-write"
+    assert bridge.DSH_TIMEOUT == 600
     assert app.snapshot()["permission_profile"] == "workspace"
     spawn.assert_not_called()
     print("PROFILE_OK")

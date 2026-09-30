@@ -9,8 +9,8 @@ Codex、Claude Code 和 Kimi 共用可追溯的知识，业务代码留在各自
 
 ## 当前版本
 
-**v0.3.0**：新增 `memory brief` 精简上下文、任务暂停/关闭/重开、相关性排序与短摘要搜索。
-保留来源和历史，并发状态冲突不自动裁决。历史变化、升级注意事项与旧编号映射见 [版本记录](docs/changelog.md)。
+**v0.4.0**：飞书遥控新增第二个 harness DSH（`/claude` · `/dsh` 粘性切换，各存一条原生会话），
+卡片改为两行，新增规范重启脚本。历史变化、升级注意事项与旧编号映射见 [版本记录](docs/changelog.md)。
 
 ## 主要功能
 
@@ -124,10 +124,11 @@ pixi run memory task --task release-check --state active --agent codex \
 | 指令 | 作用 |
 |---|---|
 | `/help` | 查看命令与打断词 |
-| `/new` | 新建会话，保留工作目录与累计统计 |
-| `/status` | 查看会话、目录、上下文占比和队列 |
+| `/claude` / `/dsh` | 粘性切换 harness，分别保存上下文与统计 |
+| `/new [claude\|dsh\|all]` | 清空指定 harness 会话，保留工作目录与累计统计 |
+| `/status` | 查看当前 harness、两套会话、目录、上下文和队列 |
 | `/cd <目录>` | 切换该会话工作目录 |
-| `/cost` | 查看累计成本、轮次和时长 |
+| `/cost` | 查看当前 harness 累计轮次、输出 token 和时长 |
 | `/queue <指令>` | 当前任务结束后继续执行，上限 5 条 |
 
 直接发送普通文本可执行任务；执行中可发「停」「停止」「打断」「取消」「stop」「cancel」打断。

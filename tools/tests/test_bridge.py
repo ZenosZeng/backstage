@@ -7,6 +7,7 @@ import importlib.util
 import json
 import os
 import signal
+import sys
 import socket
 import subprocess
 import tempfile
@@ -19,6 +20,7 @@ from unittest import mock
 
 
 ROOT = Path(__file__).resolve().parents[1] / "claude_feishu"
+sys.path.insert(0, str(ROOT.parents[1]))
 
 
 def _event(*, message_id="m1", event_id="e1", created_at_ms=None, sender_type="user"):
@@ -93,8 +95,8 @@ class SessionContextTests(unittest.TestCase):
         self.assertTrue(self.sessions.exists())
         self.assertEqual(self.sessions.stat().st_mode & 0o777, 0o600)
         payload = json.loads(self.sessions.read_text())
-        self.assertEqual(payload["version"], 1)
-        self.assertEqual(payload["chats"]["chat-a"]["session_id"], sid1)
+        self.assertEqual(payload["version"], 2)
+        self.assertEqual(payload["chats"]["chat-a"]["sessions"]["claude"]["session_id"], sid1)
 
     def test_session_disabled_returns_none(self):
         bridge = self.bridge
@@ -337,10 +339,10 @@ class RunClaudeProgressTests(unittest.TestCase):
         state.observe({"type": "assistant", "message": {"content": [
             {"type": "text", "text": "干活"}]}})
         running = bridge._card(state, 65.0)
-        self.assertEqual(running["header"]["title"]["content"], "🤖 执行中 · 1min05s")
+        self.assertEqual(running["header"]["title"]["content"], "🤖 Claude 执行中 · 1min05s")
         self.assertNotIn("1min05s", running["elements"][0]["text"]["content"])
         done = bridge._card(state, 133.0, done="答案")
-        self.assertEqual(done["header"]["title"]["content"], "✅ 执行完成 · 2min13s")
+        self.assertEqual(done["header"]["title"]["content"], "✅ Claude 执行完成 · 2min13s")
         state.returncode = 1
         self.assertIn("· 2min13s", bridge._card(state, 133.0, done="x")["header"]["title"]["content"])
 
@@ -388,16 +390,17 @@ class RunClaudeProgressTests(unittest.TestCase):
         self.assertEqual(bridge._short_path("/opt/other"), "/opt/other")
 
     def test_card_header_carries_statusline_as_subtitle(self):
-        """statusline 在 header.subtitle，底部不再挂 note 脚注。"""
+        """副标题 = 模型 · 目录 · 上下文；正文不再单挂一行目录。"""
         bridge = self.bridge
         state = bridge.RunState()
         state.model = "deepseek-flash"
         state.usage = {"input_tokens": 100, "cache_read_input_tokens": 199900}
+        expected = f"{state.model_text()} · {state.location_text()}"
         card = bridge._card(state, 3.0, done="答案")
-        self.assertEqual(card["header"]["subtitle"]["content"], state.statusline())
-        self.assertEqual([e["tag"] for e in card["elements"]], ["div"])
+        self.assertEqual(card["header"]["subtitle"]["content"], expected)
+        self.assertEqual(card["elements"][0]["text"]["content"], "答案")
         progress = bridge._card(state, 3.0)
-        self.assertEqual(progress["header"]["subtitle"]["content"], state.statusline())
+        self.assertEqual(progress["header"]["subtitle"]["content"], expected)
 
     def test_card_falls_back_to_no_subtitle_when_rejected(self):
         """回归：服务端不认 header.subtitle 时去掉重试，而不是整张卡片发不出去。"""
@@ -690,7 +693,7 @@ class RichOutputTests(unittest.TestCase):
         state.observe({"type": "result", "result": "完", "num_turns": 3,
                        "total_cost_usd": 0.0523, "usage": {"output_tokens": 2400}})
         card = bridge._card(state, 100.0, done="答案")
-        note = card["elements"][1]["elements"][0]["content"]
+        note = card["elements"][-1]["elements"][0]["content"]
         self.assertIn("3 轮", note)
         self.assertIn("2.4k tok", note)
         self.assertIn("$0.0523", note)
@@ -769,7 +772,7 @@ class CommandTests(unittest.TestCase):
         with mock.patch.object(bridge, "_persist_sessions"):
             bridge._chat_sessions["chat"] = {"workdir": "/tmp"}
             bridge._get_or_create_session("chat")
-        self.assertTrue(bridge._chat_sessions["chat"].get("session_id"))
+        self.assertTrue(bridge._chat_sessions["chat"]["sessions"]["claude"].get("session_id"))
         self.assertEqual(bridge._chat_sessions["chat"]["workdir"], "/tmp")
 
     def test_queue_reports_position_and_caps(self):

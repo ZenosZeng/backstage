@@ -39,7 +39,7 @@ PID 身份通过启动时间、命令、工作目录核验；不会用宽泛 `pk
 |---|---|
 | watchdog-b1k | `repo_root`、`log`、`eval_config` |
 | watchdog-train | `repo_root`、`log_root`、`kubectl_args`、`experiments` |
-| claude-feishu | `credentials_file`、`workdir`、`claude_cli`、`timeout_seconds`、`permission_profile` |
+| claude-feishu | `credentials_file`、`workdir`、`claude_cli`、`dsh_cli`、`claude_model_name`、`dsh_model_name`、`timeout_seconds`、`dsh_timeout_seconds`、`permission_profile` |
 
 B1K 默认查找 `scripts/eval/{fleet,0srv16sim,2srv14sim,8srv8sim}/eval.log` 中最新日志。
 自定义请求建议显式指定 `log` 和 `eval_config`；兼容 `B1K_EVAL_LOG` / `B1K_EVAL_CONFIG`，
@@ -68,7 +68,9 @@ Fleet 日志默认使用 900/3600 秒，告警每分钟检查。正式多机评�
 
 遥控使用 `FEISHU_APP_ID`、`FEISHU_APP_SECRET`、`FEISHU_ALLOW_OPEN_IDS`，群聊还需
 `FEISHU_BOT_OPEN_ID`。默认凭据路径 `~/.config/claude-feishu/env`；空白名单拒绝启动。
-CLI 为已安装的 `claude`，也可通过 `claude_cli` 指定，不自动安装或更改 Claude 登录配置。
+默认使用已安装的 `claude`，也可通过 `claude_cli` 指定。第二个 harness DSH 是可选依赖，
+`dsh_cli` > `DSH_CLI` > PATH；未安装时 `/dsh` 拒绝切换，Claude 继续可用。
+工具不自动安装 CLI 或更改登录配置。
 
 ```bash
 pixi run claude-feishu --once
@@ -89,14 +91,16 @@ pixi run claude-feishu --stop
 | 命令 | 作用 |
 |---|---|
 | `/help` | 列出全部命令与打断词 |
-| `/new` | 开新会话（清空上下文，保留工作目录与累计统计） |
-| `/status` | 会话状态：会话 id、目录、上下文占比、队列、累计 |
+| `/claude` / `/dsh` | 为当前 chat 粘性切换 harness，分别保存上下文与统计 |
+| `/new [claude\|dsh\|all]` | 清空指定 harness 上下文，默认当前；保留目录与累计统计 |
+| `/status` | 当前 harness、两套会话及统计、CLI 可用性、目录、上下文、队列 |
 | `/cd <目录>` | 切换该会话的工作目录 |
-| `/cost` | 本会话累计成本/轮次/时长 |
+| `/cost` | 当前 harness 累计轮次、输出 token、时长；DSH 不报告成本 |
 | `/queue <指令>` | 排队执行（当前任务结束后自动开始，上限 5 条） |
 
 执行中发「停」「停止」「打断」「取消」「stop」「cancel」打断当前任务；发其他内容会
-提示忙并建议用 `/queue`。命令与统计按 chat 隔离。
+提示忙并建议用 `/queue`。命令与统计按 chat 隔离。DSH 的权限、限制与部署注意见
+[DSH harness 参考](claude_feishu/README.md)。
 
 权限档由本机配置的 `permission_profile` 选择，新机器默认 `read-only`。
 经用户明确授权，可设为 `workspace`，保留原遥控的 Read/Glob/Grep/Bash/Edit/Write/WebFetch
@@ -128,3 +132,4 @@ pixi run -e dev lint
 
 测试使用 mock 飞书、合成业务数据、隔离的临时服务；不访问 GPU，不启动训练/评测。
 `b1k_layout.py` 是只读产物路径协议适配，不依赖 evaluator 模块；业务路径协议变动时须同步测试此适配。
+`lint` 只启用 `E9,F63,F7,F82`（语法错误、未定义名一类），不代表完整风格检查；要更严的规则需显式 `--select`。

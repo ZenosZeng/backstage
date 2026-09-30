@@ -59,14 +59,23 @@ def factory(config: dict, config_path: Path, directory: Path) -> Application:
         raise ValueError(
             "Claude CLI not found; set claude_cli in the local configuration"
         )
+    dsh_binary = str(config.get("dsh_cli") or os.environ.get("DSH_CLI") or shutil.which("dsh") or "")
+    if dsh_binary:
+        os.environ["DSH_CLI"] = dsh_binary
     profile, settings = settings_for_profile(config)
     os.environ.update(
         {
             "CLAUDE_CLI": binary,
+            "CLAUDE_FEISHU_CLAUDE_MODEL_NAME": str(config.get("claude_model_name", "")),
+            "CLAUDE_FEISHU_DSH_MODEL_NAME": str(config.get("dsh_model_name", "")),
+            # DSH 事件流不报窗口，只能声明；0 表示不报百分比（只显示 ctx Nk）
+            "CLAUDE_FEISHU_DSH_CONTEXT_WINDOW": str(int(config.get("dsh_context_window", 0))),
+            "CLAUDE_FEISHU_DSH_PERMISSION_MODE": "workspace-write" if profile == "workspace" else "read-only",
             "CLAUDE_FEISHU_WORKDIR": str(workdir),
             "CLAUDE_FEISHU_SETTINGS": str(settings),
             "CLAUDE_FEISHU_STATE": str(directory / "seen.json"),
             "CLAUDE_FEISHU_SESSIONS": str(directory / "sessions.json"),
+            "CLAUDE_FEISHU_DSH_TIMEOUT": str(int(config.get("dsh_timeout_seconds", 600))),
             "CLAUDE_FEISHU_TIMEOUT": str(int(config.get("timeout_seconds", 600))),
             "CLAUDE_FEISHU_PROGRESS_INTERVAL": str(
                 int(config.get("progress_interval_seconds", os.environ.get(
@@ -75,6 +84,8 @@ def factory(config: dict, config_path: Path, directory: Path) -> Application:
             ),
         }
     )
+    if int(os.environ["CLAUDE_FEISHU_DSH_TIMEOUT"]) <= 0:
+        raise ValueError("dsh_timeout_seconds must be positive")
     if int(os.environ["CLAUDE_FEISHU_TIMEOUT"]) <= 0:
         raise ValueError("timeout_seconds must be positive")
     if int(os.environ["CLAUDE_FEISHU_PROGRESS_INTERVAL"]) < 0:
@@ -92,6 +103,7 @@ def factory(config: dict, config_path: Path, directory: Path) -> Application:
             "allowed_users": len(bridge.ALLOW_OPEN_IDS),
             "workdir": str(workdir),
             "permission_profile": profile,
+            "dsh_available": bridge.harness.REGISTRY["dsh"].available(),
             "session_count": len(bridge._chat_sessions),
         },
         shutdown=shutdown,

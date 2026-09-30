@@ -1,0 +1,13 @@
+{"type":"session","sessionId":"session-fixture","cwd":"/tmp/dsh-bridge-fixture"}
+{"type":"status","phase":"turn_start","turn":1}
+{"type":"status","phase":"step_start","turn":1,"step":1}
+{"type":"thinking","text":"The user asks in Chinese: call terminal tool exactly once to run `ls -1`, list current directory files, then report result in one sentence. Don't modify files.\n\nSimple single-step task. Just run bash once."}
+{"type":"tool_call","callId":"call_00_sTc2C51EFginrgzeUiQ55790","tool":"bash","input":{"command":"ls -1","description":"List files in current directory"}}
+{"type":"tool_result","callId":"call_00_sTc2C51EFginrgzeUiQ55790","status":"completed","result":"alpha.txt\nbeta.txt\ngamma.txt\n[stderr]\nlandlock-run: partial enforcement (older Landlock ABI)\n"}
+{"type":"status","phase":"step_end","turn":1,"step":1,"usage":{"inputTokens":5096,"outputTokens":104,"cacheReadTokens":384,"cacheWriteTokens":0,"totalTokens":5584}}
+{"type":"status","phase":"step_start","turn":1,"step":2}
+{"type":"thinking","text":"Report in one sentence. Only called once."}
+{"type":"text","text":"当前目录下共有三个文件：`alpha.txt`、`beta.txt` 和 `gamma.txt`（stderr 中有一条 Landlock 部分强制执行的提示，未做任何修改）。"}
+{"type":"status","phase":"step_end","turn":1,"step":2,"usage":{"inputTokens":246,"outputTokens":51,"cacheReadTokens":5376,"cacheWriteTokens":0,"totalTokens":5673}}
+{"type":"status","phase":"turn_end","turn":1,"reason":{"kind":"completed"}}
+{"type":"final","text":"当前目录下共有三个文件：`alpha.txt`、`beta.txt` 和 `gamma.txt`（stderr 中有一条 Landlock 部分强制执行的提示，未做任何修改）。"}
