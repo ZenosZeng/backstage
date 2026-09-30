@@ -863,7 +863,7 @@ def parser() -> argparse.ArgumentParser:
     subparsers = result.add_subparsers(dest="command", required=True)
 
     add = subparsers.add_parser("add", help="原子追加一条事件")
-    add.add_argument("--agent", required=True, choices=("codex", "claude", "kimi"))
+    add.add_argument("--agent", required=True, choices=("codex", "claude", "kimi", "dsh"))
     add.add_argument("--project", action="append", default=[])
     add.add_argument("--task")
     add.add_argument("--type", dest="event_type", required=True, choices=sorted(EVENT_TYPES))
@@ -897,7 +897,7 @@ def parser() -> argparse.ArgumentParser:
     task = subparsers.add_parser("task", help="追加任务生命周期决定，不改历史记录")
     task.add_argument("--task", required=True, help="工作区内唯一、跨 repo 稳定 task ID")
     task.add_argument("--state", required=True, choices=sorted(TASK_STATES))
-    task.add_argument("--agent", required=True, choices=("codex", "claude", "kimi"))
+    task.add_argument("--agent", required=True, choices=("codex", "claude", "kimi", "dsh"))
     task.add_argument("--project", action="append", default=[])
     task.add_argument("--reason", required=True)
     task.add_argument("--where", action="append", required=True, help="决定依据/来源")
