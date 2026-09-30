@@ -54,6 +54,44 @@ def test_pid_reuse_and_unrelated_process_are_rejected(tmp_path):
         kill.assert_not_called()
 
 
+def test_sandbox_unreadable_cwd_keeps_a_live_process_visible(tmp_path, monkeypatch):
+    """回归：沙箱拒绝读 /proc/<pid>/cwd 时，不能把活着的服务判成已停止。
+
+    DSH 的 Landlock 沙箱下跑 scripts/restart-claude-feishu.sh 实测复现：cwd 读被拒
+    → running_record 返回 None → status 误报未运行、stop 静默空转（打印 stopped 却不发
+    SIGTERM）→ 随后的 start 撞上仍在运行的 run.lock，重启失败。其余四道指纹已足以
+    确认身份，故 cwd 读不到时应放行。
+    """
+    atomic_json(
+        tmp_path / "pid.json",
+        {
+            "name": "claude-feishu",
+            "pid": os.getpid(),
+            "start_ticks": service.process_start(os.getpid()),
+            "root": str(ROOT),
+        },
+    )
+    real_path = service.Path
+
+    class _SandboxedProcPath:
+        """只让 /proc 下的 cwd 解析失败，其余路径行为不变。"""
+
+        def __init__(self, path):
+            self._real = real_path(path)
+
+        def read_bytes(self):
+            return b"-m\0tools.claude_feishu\0--foreground\0"
+
+        def resolve(self):
+            raise PermissionError(13, "Permission denied")
+
+        def __getattr__(self, name):
+            return getattr(self._real, name)
+
+    monkeypatch.setattr(service, "Path", _SandboxedProcPath)
+    assert service.running_record(tmp_path, "claude-feishu") is not None
+
+
 def test_independent_services_start_reuse_stop(tmp_path):
     config = tmp_path / "monitor.json"
     config.write_text(

@@ -60,8 +60,15 @@ def running_record(directory: Path, name: str) -> dict | None:
             return None
         if b"--foreground" not in command or str(ROOT) != record["root"]:
             return None
-        if Path(f"/proc/{pid}/cwd").resolve() != ROOT:
-            return None
+        try:
+            if Path(f"/proc/{pid}/cwd").resolve() != ROOT:
+                return None
+        except OSError:
+            # 沙箱（如 DSH 的 Landlock）会拒绝读 /proc/<pid>/cwd。读不到 ≠ 进程不在：
+            # start_ticks、cmdline、--foreground、root 四道指纹已确认身份，故放行。
+            # 若在此返回 None，status 会把活着的服务报成 stopped，stop 更会静默空转
+            # （打印 stopped 却不发 SIGTERM），随后的 start 再撞 run.lock 失败。
+            pass
         return record
     except (OSError, ValueError, KeyError, TypeError):
         return None
