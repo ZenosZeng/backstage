@@ -15,6 +15,7 @@ import subprocess
 import sys
 import threading
 import time
+import uuid
 from typing import Callable
 
 from tools.config import ROOT, atomic_json, load_config, local_root
@@ -28,6 +29,7 @@ class Application:
     run: Callable[[threading.Event], int]
     snapshot: Callable[[], object]
     shutdown: Callable[[], None] | None = None
+    ready: bool = True
 
 
 def process_start(pid: int) -> str | None:
@@ -91,6 +93,7 @@ def parser(name: str) -> argparse.ArgumentParser:
     result = argparse.ArgumentParser(description=f"Agent workspace service: {name}")
     action = result.add_mutually_exclusive_group()
     action.add_argument("--stop", action="store_true")
+    action.add_argument("--restart", action="store_true")
     action.add_argument("--status", action="store_true")
     action.add_argument("--foreground", action="store_true")
     action.add_argument(
@@ -105,6 +108,8 @@ def parser(name: str) -> argparse.ArgumentParser:
         "--no-notify", action="store_true", help="disable watchdog Feishu messages"
     )
     result.add_argument("--json", action="store_true")
+    result.add_argument("--restart-timeout", type=int, default=60)
+    result.add_argument("--reply-message", help="reply to this Feishu restart command after completion")
     return result
 
 
@@ -114,6 +119,8 @@ def status(name: str, directory: Path, *, as_json: bool = False) -> int:
         "service": name,
         "running": bool(record),
         "pid": record["pid"] if record else None,
+        "ready": bool(record and record.get("ready", False)),
+        "restart_supported": bool(record and record.get("generation")),
         "log": str(directory / "service.log"),
     }
     print(
@@ -122,6 +129,39 @@ def status(name: str, directory: Path, *, as_json: bool = False) -> int:
         else f"{name}: {'running pid=' + str(data['pid']) if record else 'stopped'} | log={data['log']}"
     )
     return 0
+
+
+def mark_ready(directory: Path) -> None:
+    record = running_record(directory, "claude-feishu")
+    if record and record["pid"] == os.getpid():
+        record["ready"] = True
+        atomic_json(directory / "pid.json", record)
+
+
+def restart(name: str, directory: Path, *, timeout: int = 60) -> int:
+    """Ask the existing service to re-exec; never spawn it from the caller."""
+    if not 1 <= timeout <= 300:
+        raise ValueError("restart-timeout must be between 1 and 300 seconds")
+    with lock(directory / "lifecycle.lock"):
+        record = running_record(directory, name)
+        if not record or not record.get("generation"):
+            raise ValueError("service is stopped or too old for in-process restart; start it once from the host")
+        generation = record["generation"]
+        # A previous rejected request must not mask this request's validation.
+        record.pop("restart_error", None)
+        atomic_json(directory / "pid.json", record)
+        os.kill(record["pid"], signal.SIGUSR1)
+        deadline = time.monotonic() + timeout
+        while time.monotonic() < deadline:
+            current = running_record(directory, name)
+            if current:
+                if current.get("restart_error"):
+                    raise ValueError(current["restart_error"])
+                if current.get("generation") != generation and current.get("ready"):
+                    print(f"{name}: restarted and ready pid={current['pid']}")
+                    return 0
+            time.sleep(0.1)
+        raise ValueError("restart did not become ready before timeout; inspect service.log")
 
 
 def stop(name: str, directory: Path) -> int:
@@ -150,6 +190,29 @@ def main(
     directory = local_root() / "tools" / name
     os.umask(0o077)
     try:
+        if args.reply_message and (not args.restart or name != "claude-feishu"):
+            raise ValueError("reply-message requires claude-feishu --restart")
+        if args.restart:
+            error = None
+            try:
+                restart(name, directory, timeout=args.restart_timeout)
+            except (OSError, ValueError) as exc:
+                error = str(exc)
+            if args.reply_message and error is None:
+                # This CLI is spawned by the authenticated native /restart handler.
+                # It survives the bridge re-exec and replies only after WS readiness.
+                from types import SimpleNamespace
+
+                config, config_path = load_config(name, args.config)
+                factory(config, config_path, directory)
+                from tools.claude_feishu import bridge
+
+                data = SimpleNamespace(event=SimpleNamespace(message=SimpleNamespace(message_id=args.reply_message)))
+                if not bridge._send_reply(data, "✅ bridge 已重启，飞书连接就绪。Claude / DSH 会话已保留。"):
+                    print("restart result reply failed", file=sys.stderr)
+            if error:
+                raise ValueError(error)
+            return 0
         if args.status:
             return status(name, directory, as_json=args.json)
         if args.stop:
@@ -221,6 +284,7 @@ def main(
                     child.kill()
                     child.wait(timeout=5)
                 raise ValueError("service startup timed out; child terminated")
+        restart_requested = False
         with lock(directory / "run.lock"):
             app = factory(config, config_path, directory)
             event = threading.Event()
@@ -239,12 +303,60 @@ def main(
                 "root": str(ROOT),
                 "config_hash": fingerprint,
                 "config_path": str(config_path),
+                "generation": str(uuid.uuid4()),
+                "ready": app.ready,
             }
+
+            def request_restart(_signum, _frame):
+                nonlocal restart_requested
+                if restart_requested or event.is_set():
+                    return
+                # Validate updated code/config from the SERVICE's context first.
+                # Rejection keeps the old connection alive, including on syntax errors.
+                validation = [sys.executable, "-m", *command, "--once", "--config", str(config_path)]
+                checked = None
+                try:
+                    checked = subprocess.run(validation, cwd=ROOT, capture_output=True, timeout=20)
+                    valid = checked.returncode == 0
+                except (OSError, subprocess.TimeoutExpired):
+                    valid = False
+                if not valid:
+                    print("restart preflight failed; old service kept running", file=sys.stderr)
+                    if checked is not None:
+                        print(checked.stderr.decode(errors="replace")[-4000:], file=sys.stderr)
+                    current = running_record(directory, name) or record
+                    current["restart_error"] = "new code/config validation failed; old service kept running"
+                    atomic_json(directory / "pid.json", current)
+                    return
+                restart_requested = True
+                request_stop(_signum, _frame)
+
+            signal.signal(signal.SIGUSR1, request_restart)
             atomic_json(directory / "pid.json", record)
             try:
-                return app.run(event)
+                try:
+                    result = app.run(event)
+                except SystemExit:
+                    if not restart_requested:
+                        raise
+                    result = 0
             finally:
                 (directory / "pid.json").unlink(missing_ok=True)
+        if restart_requested:
+            # run.lock has been released. Re-exec preserves the original host
+            # context, not the requesting agent's inherited Landlock sandbox.
+            restart_command = [sys.executable, "-m", *command, "--foreground", "--config", str(config_path)]
+            if args.no_notify:
+                restart_command.append("--no-notify")
+            # Factory-injected CLI/workdir values are derived from config, not
+            # caller overrides. Restore the original overrides before reloading.
+            for key, value in environment.items():
+                if value is None:
+                    os.environ.pop(key, None)
+                else:
+                    os.environ[key] = value
+            os.execv(sys.executable, restart_command)
+        return result
     except (OSError, ValueError) as error:
         print(f"{name}: {error}", file=sys.stderr)
         return 2

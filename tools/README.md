@@ -75,6 +75,7 @@ Fleet 日志默认使用 900/3600 秒，告警每分钟检查。正式多机评�
 ```bash
 pixi run claude-feishu --once
 pixi run claude-feishu
+pixi run claude-feishu --restart
 pixi run claude-feishu --stop
 ```
 
@@ -94,6 +95,7 @@ pixi run claude-feishu --stop
 | `/claude` / `/dsh` | 为当前 chat 粘性切换 harness，分别保存上下文与统计 |
 | `/new [claude\|dsh\|all]` | 清空指定 harness 上下文，默认当前；保留目录与累计统计 |
 | `/status` | 当前 harness、两套会话及统计、CLI 可用性、目录、上下文、队列 |
+| `/restart` | 校验新代码/配置，由宿主 bridge 自行重载；保持会话，就绪后回复原消息 |
 | `/cd <目录>` | 切换该会话的工作目录 |
 | `/cost` | 当前 harness 累计轮次、输出 token、时长；DSH 不报告成本 |
 | `/queue <指令>` | 排队执行（当前任务结束后自动开始，上限 5 条） |
@@ -106,7 +108,12 @@ pixi run claude-feishu --stop
 经用户明确授权，可设为 `workspace`，保留原遥控的 Read/Glob/Grep/Bash/Edit/Write/WebFetch
 以及原危险命令 deny 列表。不会添加跳过权限检查的参数，也不接受任意 settings 路径。
 这只是 Claude 工具权限规则，不是操作系统沙箱；Bash 具有当前用户权限，应仅对白名单可信用户开放。
-不要在消息或上下文中暴露凭据。配置改变后先 `--stop` 再启动。
+不要在消息或上下文中暴露凭据。配置改变后可在飞书发 `/restart`，当前任务或队列未完成时拒绝重启。
+原生命令通过现有用户白名单，直接由 bridge 处理，不进入 Claude/DSH 的模型执行。
+校验失败保留旧服务并回复失败；成功回执等待新实例的 websocket 就绪，保留两套原生会话。
+沙箱内的 agent 使用 `scripts/restart-claude-feishu.sh --detach --delay 30`，只请求服务自行重载，
+不会从 agent 的 Landlock 上下文启动新服务。`setsid` 本身不能解除沙箱。
+旧版 daemon 首次升级需从宿主机停起一次；旧版或未运行服务收到新重启请求时会拒绝，不自动 stop/start。
 保留消息/event/fingerprint 防重放、过期消息拒绝、聊天会话映射、串行执行、超时进程组清理。
 
 ## 运行状态与迁移

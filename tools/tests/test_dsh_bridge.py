@@ -52,6 +52,77 @@ def events():
     ]
 
 
+def test_native_restart_is_managed_and_preserves_sessions(bridge, monkeypatch, tmp_path):
+    from types import SimpleNamespace
+
+    data = SimpleNamespace(event=SimpleNamespace(message=SimpleNamespace(message_id="restart-message")))
+    bridge._service_ready = lambda: None
+    bridge._service_config_path = str(tmp_path / "custom.json")
+    bridge._get_or_create_session("chat", "claude")
+    before = json.dumps(bridge._chat_sessions, sort_keys=True)
+    process = mock.Mock()
+    process.wait.return_value = 2
+    popen = mock.Mock(return_value=process)
+    monkeypatch.setattr(bridge.subprocess, "Popen", popen)
+    worker = mock.Mock()
+    monkeypatch.setattr(bridge.threading, "Thread", worker)
+    run = mock.Mock()
+    monkeypatch.setattr(bridge, "_run_agent", run)
+    assert bridge._handle_command(data, "/restart", "chat")
+    argv = popen.call_args.args[0]
+    assert argv == [sys.executable, "-m", "tools.claude_feishu", "--restart", "--config",
+                    bridge._service_config_path, "--reply-message", "restart-message"]
+    assert popen.call_args.kwargs["start_new_session"] is True
+    assert bridge._restart_pending.is_set()
+    assert json.dumps(bridge._chat_sessions, sort_keys=True) == before
+    run.assert_not_called()
+    # A rejected validation replies from the still-running old bridge.
+    worker.call_args.kwargs["target"]()
+    assert not bridge._restart_pending.is_set()
+    assert "重启未完成" in bridge._send_reply.call_args.args[1]
+
+
+@pytest.mark.parametrize("condition", ["busy", "queued", "unmanaged", "reply_failed", "argument"])
+def test_native_restart_rejection_keeps_bridge_running(bridge, monkeypatch, condition):
+    bridge._service_ready = lambda: None
+    bridge._service_config_path = "private-config.json"
+    popen = mock.Mock()
+    monkeypatch.setattr(bridge.subprocess, "Popen", popen)
+    if condition == "busy":
+        bridge._lock.acquire()
+    elif condition == "queued":
+        bridge._chat_queues["chat"] = ["pending"]
+    elif condition == "unmanaged":
+        bridge._service_ready = None
+    elif condition == "reply_failed":
+        bridge._send_reply.return_value = False
+    try:
+        bridge._cmd_restart(None, "unexpected" if condition == "argument" else "")
+        popen.assert_not_called()
+        assert not bridge._restart_pending.is_set()
+    finally:
+        if condition == "busy":
+            bridge._lock.release()
+
+
+def test_native_restart_still_requires_sender_allowlist(bridge, monkeypatch):
+    import time
+    from types import SimpleNamespace
+
+    restart = mock.Mock()
+    monkeypatch.setattr(bridge, "_cmd_restart", restart)
+    data = SimpleNamespace(
+        header=SimpleNamespace(event_id="restart-denied", create_time=str(int(time.time()*1000))),
+        event=SimpleNamespace(
+            message=SimpleNamespace(message_id="restart-denied", create_time=str(int(time.time()*1000)),
+                                    chat_id="chat", chat_type="p2p", message_type="text", mentions=[],
+                                    content=json.dumps({"text":"/restart"})),
+            sender=SimpleNamespace(sender_type="user", sender_id=SimpleNamespace(open_id="stranger"))))
+    bridge.handle_message(data)
+    restart.assert_not_called()
+    bridge._send_reply.assert_not_called()
+
+
 class TaskInput(io.StringIO):
     def close(self):
         self.task = self.getvalue()

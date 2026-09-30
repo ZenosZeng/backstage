@@ -212,6 +212,9 @@ _process_lock = threading.Lock()
 _stopping = threading.Event()
 _interrupt_requested = threading.Event()  # 本轮的打断请求（跨 _run_claude 传递）
 _active_process = None
+_restart_pending = threading.Event()
+_service_ready: Callable[[], None] | None = None
+_service_config_path: str = ""
 _token: dict[str, object] = {"token": "", "expires": 0.0}
 
 
@@ -1372,6 +1375,7 @@ HELP_TEXT = (
     "- `/claude` / `/dsh` 粘性切换，两套会话独立保存\n"
     "- `/new [claude|dsh|all]` 清空指定会话（默认当前 harness）\n"
     "- `/status` 会话状态（目录/上下文/队列/累计）\n"
+    "- `/restart` 校验新代码后重启 bridge，保留会话并回复就绪结果\n"
     "- `/cd <目录>` 切换工作目录\n"
     "- `/cost` 本会话累计成本与轮次\n"
     "- `/queue <指令>` 排队执行（当前任务结束后自动开始）\n"
@@ -1515,6 +1519,49 @@ def _cmd_queue(data: P2ImMessageReceiveV1, chat_id: str, arg: str) -> None:
     _kick_queue()
 
 
+def _cmd_restart(data, arg=""):
+    if arg:
+        _send_reply(data, "用法：`/restart`，不带参数。")
+        return
+    if not _lock.acquire(blocking=False):
+        _send_reply(data, "⏳ 当前任务仍在执行。请等完成或发「停」，然后再发 /restart。")
+        return
+    try:
+        with _queue_lock:
+            queued = any(_chat_queues.values())
+        if _restart_pending.is_set() or queued:
+            _send_reply(data, "⏳ 已在重启或仍有排队任务，请完成后再试。")
+            return
+        if _service_ready is None:
+            _send_reply(data, "⚠️ 请使用 Pixi 管理的 bridge 服务启动后再重启。")
+            return
+        if not _send_reply(data, "🔄 正在校验新代码并重启 bridge，就绪后会回复本消息。"):
+            return
+        _restart_pending.set()
+        try:
+            proc = subprocess.Popen(
+                [sys.executable, "-m", "tools.claude_feishu", "--restart", "--config", _service_config_path,
+                 "--reply-message", data.event.message.message_id],
+                cwd=str(SCRIPT_DIR.parents[1]), stdin=subprocess.DEVNULL,
+                start_new_session=True, close_fds=True,
+            )
+        except OSError:
+            _restart_pending.clear()
+            _send_reply(data, "⚠️ 无法提交重启请求，旧 bridge 仍在运行。")
+            return
+
+        def finish():
+            code = proc.wait()
+            # If validation was rejected, the old bridge continues accepting work.
+            _restart_pending.clear()
+            if code != 0:
+                _send_reply(data, "⚠️ 重启未完成。请检查新代码或配置；详情见 .agents/.local/tools/claude-feishu/service.log。")
+
+        threading.Thread(target=finish, daemon=True).start()
+    finally:
+        _lock.release()
+
+
 def _handle_command(data: P2ImMessageReceiveV1, text: str, chat_id: str) -> bool:
     """命令拦截；返回 True 表示已处理、不再进 claude。"""
     if not text.startswith("/"):
@@ -1522,6 +1569,9 @@ def _handle_command(data: P2ImMessageReceiveV1, text: str, chat_id: str) -> bool
     parts = text.split(maxsplit=1)
     cmd = parts[0].lower()
     arg = parts[1].strip() if len(parts) > 1 else ""
+    if _restart_pending.is_set() and cmd not in ("/status", "/help", "/h", "/?"):
+        _send_reply(data, "🔄 bridge 正在重启，就绪后再发送指令。")
+        return True
     if cmd in ("/help", "/h", "/?"):
         _send_reply(data, f"当前 harness：{_chat_harness(chat_id)}\n\n" + HELP_TEXT)
     elif cmd in ("/new", "/clear"):
@@ -1530,6 +1580,8 @@ def _handle_command(data: P2ImMessageReceiveV1, text: str, chat_id: str) -> bool
         _cmd_harness(data, chat_id, cmd[1:], arg)
     elif cmd == "/status":
         _cmd_status(data, chat_id)
+    elif cmd == "/restart":
+        _cmd_restart(data, arg)
     elif cmd == "/cost":
         _cmd_cost(data, chat_id)
     elif cmd == "/cd":
@@ -1642,6 +1694,9 @@ def _execute_and_reply(
             logging.warning("busy reply send failed")
         return
     try:
+        if _restart_pending.is_set():
+            _send_reply(data, "🔄 bridge 正在重启，就绪后再发送指令。")
+            return
         selected = _chat_harness(chat_id)
         if selected == "dsh" and not harness.REGISTRY["dsh"].available():
             _send_reply(data, "❌ 本机没有找到 dsh，安装后重启服务；可用 /claude 切回。")
@@ -1715,6 +1770,8 @@ class ObservedClient(ws.Client):
         await super()._connect()
         if self._conn is not None:
             logging.info("Feishu websocket connected")
+            if _service_ready is not None:
+                _service_ready()
 
 
 def main() -> int:

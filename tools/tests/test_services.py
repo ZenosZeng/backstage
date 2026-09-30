@@ -249,3 +249,156 @@ def test_remote_shutdown_kills_only_owned_child(monkeypatch, tmp_path):
         if child.poll() is None:
             child.kill()
             child.wait()
+
+
+def test_restart_rejects_legacy_service_before_signalling(monkeypatch, tmp_path):
+    monkeypatch.setattr(service, "running_record", lambda *args: {"pid": 123})
+    with patch.object(service.os, "kill") as kill:
+        with pytest.raises(ValueError, match="too old"):
+            service.restart("claude-feishu", tmp_path)
+        kill.assert_not_called()
+
+
+def test_reexec_restores_caller_overrides_and_releases_run_lock(monkeypatch, tmp_path):
+    config = tmp_path / "config.json"
+    config.write_text("{}")
+    monkeypatch.setenv("AGENTS_LOCAL_ROOT", str(tmp_path))
+    monkeypatch.delenv("CLAUDE_CLI", raising=False)
+    monkeypatch.delenv("CLAUDE_FEISHU_WORKDIR", raising=False)
+    handlers = {}
+    monkeypatch.setattr(service.signal, "signal", lambda signum, handler: handlers.update({signum: handler}))
+    monkeypatch.setattr(service.subprocess, "run", lambda *args, **kwargs: SimpleNamespace(returncode=0))
+
+    def factory(*args):
+        os.environ["CLAUDE_CLI"] = "injected-by-factory"
+        os.environ["CLAUDE_FEISHU_WORKDIR"] = str(tmp_path)
+
+        def run(stop):
+            handlers[signal.SIGUSR1](signal.SIGUSR1, None)
+            assert stop.is_set()
+            return 0
+
+        return service.Application(run=run, snapshot=lambda: {})
+
+    def execute(binary, argv):
+        assert "CLAUDE_CLI" not in os.environ
+        assert "CLAUDE_FEISHU_WORKDIR" not in os.environ
+        assert argv[-2:] == ["--config", str(config)]
+        with service.lock(tmp_path / "claude-feishu/run.lock"):
+            pass
+        raise RuntimeError("re-exec boundary reached")
+
+    monkeypatch.setattr(service.os, "execv", execute)
+    with pytest.raises(RuntimeError, match="re-exec boundary reached"):
+        service.main("claude-feishu", ["tools.claude_feishu"], factory,
+                     ["--foreground", "--config", str(config)])
+
+
+def test_live_restart_keeps_pid_and_rejects_invalid_config(tmp_path):
+    config = tmp_path / "monitor.json"
+    valid = {"notify": False, "repo_root": str(tmp_path), "poll_seconds": 0.05}
+    config.write_text(json.dumps(valid))
+    env = {**os.environ, "AGENTS_LOCAL_ROOT": str(tmp_path / "local")}
+    for key in ("B1K_EVAL_CONFIG", "B1K_EVAL_LOG"):
+        env.pop(key, None)
+
+    def call(*args):
+        return subprocess.run([sys.executable, "-m", "tools.watchdog", "b1k", *args],
+                              cwd=ROOT, env=env, text=True, capture_output=True, timeout=40)
+
+    record_path = tmp_path / "local/tools/watchdog-b1k/pid.json"
+    try:
+        assert call("--config", str(config)).returncode == 0
+        before = json.loads(record_path.read_text())
+        completed = call("--restart", "--restart-timeout", "15")
+        assert completed.returncode == 0, completed.stderr
+        after = json.loads(record_path.read_text())
+        assert after["pid"] == before["pid"]
+        assert after["start_ticks"] == before["start_ticks"]
+        assert after["generation"] != before["generation"]
+        assert after["config_path"] == str(config)
+        assert after["config_hash"] == before["config_hash"]
+        config.write_text(json.dumps({**valid, "poll_seconds": -1}))
+        rejected = call("--restart", "--restart-timeout", "15")
+        assert rejected.returncode != 0 and "old service kept running" in rejected.stderr
+        unchanged = json.loads(record_path.read_text())
+        assert unchanged["generation"] == after["generation"]
+        assert unchanged["ready"] is True
+        assert json.loads(call("--status", "--json").stdout)["running"] is True
+        config.write_text(json.dumps(valid))
+        assert call("--restart", "--restart-timeout", "15").returncode == 0
+    finally:
+        call("--stop")
+
+
+def test_landlocked_caller_requests_host_restart_without_inheriting_sandbox(tmp_path):
+    """Real kernel restriction: the caller cannot write host storage before OR after restart."""
+    import ctypes
+    import platform
+
+    if platform.machine() != "x86_64":
+        pytest.skip("Landlock syscall numbers in this regression target Linux x86_64")
+    libc = ctypes.CDLL(None, use_errno=True)
+    if libc.syscall(444, 0, 0, 1) < 1:
+        pytest.skip("kernel does not expose Landlock")
+    local = tmp_path / "local"
+    config = tmp_path / "monitor.json"
+    config.write_text(json.dumps({"notify": False, "repo_root": str(tmp_path), "poll_seconds": 0.05}))
+    protected = tmp_path / "host-storage"
+    protected.mkdir()
+    env = {**os.environ, "AGENTS_LOCAL_ROOT": str(local)}
+    for key in ("B1K_EVAL_CONFIG", "B1K_EVAL_LOG"):
+        env.pop(key, None)
+    command = [sys.executable, "-m", "tools.watchdog", "b1k"]
+
+    def call(*args):
+        return subprocess.run([*command, *args], cwd=ROOT, env=env,
+                              text=True, capture_output=True, timeout=40)
+
+    script = '''
+import ctypes,errno,os,subprocess,sys
+from pathlib import Path
+libc=ctypes.CDLL(None,use_errno=True)
+abi=libc.syscall(444,0,0,1)
+rights=(1<<1)|sum(1<<i for i in range(4,13))
+if abi>=2:rights|=1<<13
+if abi>=3:rights|=1<<14
+class Ruleset(ctypes.Structure):_fields_=[('handled_access_fs',ctypes.c_uint64)]
+class PathRule(ctypes.Structure):
+ _pack_=1
+ _fields_=[('allowed_access',ctypes.c_uint64),('parent_fd',ctypes.c_int32)]
+attr=Ruleset(rights)
+fd=libc.syscall(444,ctypes.byref(attr),ctypes.sizeof(attr),0)
+assert fd>=0,ctypes.get_errno()
+directory=os.open(sys.argv[1],os.O_PATH)
+rule=PathRule(rights,directory)
+assert libc.syscall(445,fd,1,ctypes.byref(rule),0)==0,ctypes.get_errno()
+assert libc.prctl(38,1,0,0,0)==0
+assert libc.syscall(446,fd,0)==0,ctypes.get_errno()
+os.close(directory);os.close(fd)
+def denied():
+ try:Path(sys.argv[2]).write_text('must not write')
+ except OSError as e:assert e.errno==errno.EACCES
+ else:raise AssertionError('caller unexpectedly gained host write permission')
+denied()
+result=subprocess.run([sys.executable,'-m','tools.watchdog','b1k','--restart','--restart-timeout','15'],
+                      text=True,capture_output=True)
+assert result.returncode==0,result.stderr
+denied()
+print('DENIED before/after; host restart ready')
+'''
+    try:
+        assert call("--config", str(config)).returncode == 0
+        record_path = local / "tools/watchdog-b1k/pid.json"
+        before = json.loads(record_path.read_text())
+        requested = subprocess.run([sys.executable, "-c", script, str(local), str(protected / "denied")],
+                                   cwd=ROOT, env=env, capture_output=True, text=True, timeout=40)
+        assert requested.returncode == 0, requested.stderr
+        assert "DENIED before/after" in requested.stdout
+        after = json.loads(record_path.read_text())
+        assert after["generation"] != before["generation"]
+        assert after["pid"] == before["pid"]
+        assert after["ready"] is True
+        assert not (protected / "denied").exists()
+    finally:
+        call("--stop")

@@ -25,9 +25,8 @@ DSH 用以当前 chat 工作目录为根的文件/bash 沙箱。DSH 的交互审
 ## 卡片与显示
 
 DSH 卡片按 thinking/text commit 块刷新，有工具调用与结果，**不能逐字刷新**。
-卡片两行：主标题 = 执行器 + 状态 + 耗时，副标题 = 模型 · 目录 · 上下文。
-飞书 header 只支持 title 加一行 subtitle，三样信息只能合成一行副标题；
-副标题被服务端拒绝时降级为正文前两行，信息不丢。
+卡片三行：主标题 = 执行器 + 状态 + 耗时，副标题 = 模型名称，正文首行 = 目录与上下文。
+副标题被服务端拒绝时将模型名称保留在正文开头，信息不丢。
 
 `claude_model_name` / `dsh_model_name` 配置显示名称。这两个字段只改变显示，不切换模型，
 变更底层模型时需同步更新名称。Claude 未配置时读取事件/CLI 配置中的模型名；
@@ -64,13 +63,17 @@ DSH 默认从 `$DSH_HOME/.credentials.yaml`（默认 `~/.dsh`）读取凭据。
 
 ## 部署与回滚
 
-**部署新代码前必须先 `pixi run claude-feishu --stop`，部署后再启动。**
-旧进程内存仍持有 v1 状态，运行中升级会让它把新文件覆盖回旧结构，丢失 DSH 字段。
+从尚不支持 `--restart` 的旧 daemon 首次升级时，需在宿主机执行 `--stop` 后启动一次。
+尤其不能让持有 v1 会话的旧进程与 v2 新进程同时运行，否则旧进程可能覆盖新状态。
+安装本版后，后续代码/配置更新直接在飞书发 `/restart`，由既有 bridge 校验后在原宿主机
+上下文自行 re-exec，保留两套会话；无效代码/配置拒绝重载，旧连接继续可用。
 
 会话文件升 v2：chat 保存目录与 harness，`sessions.claude` / `sessions.dsh` 分别保存原生会话 ID
 与累计统计。首次读取 v1 时保留权限 0600 的 `sessions.json.v1.bak`，原子写入 v2，不保存聊天正文。
 回滚代码可以启动，但旧代码无法读取嵌套会话 ID；需停服务并从 `.v1.bak` 恢复，
 才能恢复迁移前的 Claude 上下文。
 
-规范重启用 `scripts/restart-claude-feishu.sh`：从飞书触发的 agent 必须加 `--detach`
-（那种 agent 是 bridge 的子进程，直接停会把自己杀掉）。
+规范重启用 `scripts/restart-claude-feishu.sh`：从 agent 调用时加 `--detach --delay 30`，
+让当前回复先结束。脚本只请求现有服务重载，不创建 bridge，也不会关闭 DSH 的 Landlock。
+`--restart` 按新的 generation 和 websocket 就绪判定成功，不能靠 PID 改变判定：re-exec 保留 PID。
+飞书原生 `/restart` 在任务/队列空闲时直接提交，成功后回复原消息；不需要模型审批或 full-access。

@@ -9,7 +9,7 @@ import shutil
 import sys
 
 from tools.config import load_env_file, resolve_path, workspace_root
-from tools.service import Application, main
+from tools.service import Application, main, mark_ready
 
 
 def settings_for_profile(config: dict) -> tuple[str, Path]:
@@ -92,6 +92,9 @@ def factory(config: dict, config_path: Path, directory: Path) -> Application:
         raise ValueError("progress_interval_seconds must be non-negative")
     from tools.claude_feishu import bridge
 
+    bridge._service_ready = lambda: mark_ready(directory)
+    bridge._service_config_path = str(config_path)
+
     def shutdown():
         bridge.shutdown()
         raise SystemExit(0)
@@ -107,6 +110,7 @@ def factory(config: dict, config_path: Path, directory: Path) -> Application:
             "session_count": len(bridge._chat_sessions),
         },
         shutdown=shutdown,
+        ready=False,
     )
 
 
